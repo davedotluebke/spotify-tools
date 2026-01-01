@@ -11,7 +11,8 @@ Automatically maintains a "Song of the Day" playlist by adding one song per day 
 **Features:**
 - Polls listening history every minute (catches Spotify Jams too)
 - Auto-selects songs using weighted random from your most-played tracks
-- 90-song cooldown prevents repeats
+- Configurable cooldown prevents repeats (default 90 songs, or disable)
+- Multiple profiles for different playlists/users/rules
 - Tracks whether songs were user-added or auto-picked
 - Optional email notifications (failures + weekly summary)
 
@@ -74,6 +75,7 @@ This opens a browser for Spotify login. After authenticating, your token is cach
 | `--finalize` | Add a song if none added today (run nightly via cron) |
 | `--dry-run` | Test finalize without actually adding to playlist |
 | `--weekly-summary` | Generate/email summary of the week's songs |
+| `--profile NAME` | Use a specific profile (see Profiles section) |
 | `-q, --quiet` | Suppress non-essential output |
 
 ### Examples
@@ -91,6 +93,50 @@ python song_of_the_day.py --weekly-summary
 
 ---
 
+## Profiles
+
+Profiles let you run multiple variations with different settings, playlists, or even different Spotify accounts.
+
+```
+~/.spotify-tools/
+├── config.json          # "default" profile (backwards compatible)
+├── .cache               # default profile's OAuth token
+├── dave-auto/           # another profile
+│   ├── config.json
+│   └── .cache           # can be same or different Spotify account
+└── uncle-bob/           # relative's profile
+    ├── config.json
+    └── .cache           # their Spotify OAuth token
+```
+
+### Usage
+
+```bash
+# Default profile (no flag needed)
+python3 song_of_the_day.py --poll
+
+# Specific profile
+python3 song_of_the_day.py --profile dave-auto --poll
+python3 song_of_the_day.py --profile uncle-bob --finalize
+```
+
+### Setting Up a New Profile
+
+```bash
+# Create the profile (just run any command)
+python3 song_of_the_day.py --profile uncle-bob --status
+
+# Edit the config
+nano ~/.spotify-tools/uncle-bob/config.json
+```
+
+For a **different Spotify account** (relatives), they need to authenticate once:
+1. Run `--status` with their profile on a machine with a browser
+2. They log in to their Spotify account
+3. Copy the `.cache` file to EC2 if needed
+
+---
+
 ## Configuration
 
 Configuration is stored at `~/.spotify-tools/config.json`. Created automatically on first run.
@@ -102,6 +148,7 @@ Configuration is stored at `~/.spotify-tools/config.json`. Created automatically
   "timezone": "America/New_York",
   "cooldown_entries": 90,
   "min_duration_ms": 50000,
+  "selection_mode": "weighted_random",
   "email_enabled": false,
   "email_to": "you@example.com",
   "email_from": "sender@example.com",
@@ -117,11 +164,32 @@ Configuration is stored at `~/.spotify-tools/config.json`. Created automatically
 | `playlist_name` | Name of your playlist (must exist in Spotify) |
 | `playlist_id` | Auto-populated after first lookup |
 | `timezone` | Your timezone for "today" calculations |
-| `cooldown_entries` | Songs can't repeat until this many others added |
+| `cooldown_entries` | Songs can't repeat until this many others added (0 = no cooldown) |
 | `min_duration_ms` | Minimum track length (filters intros/skits) |
+| `selection_mode` | `"weighted_random"` (default) or `"most_played"` (always top track) |
 | `email_enabled` | Set `true` to enable email notifications |
 | `email_to` | Recipient email address |
 | `smtp_*` | SMTP server settings (see Email Setup below) |
+
+### Example Configs
+
+**Auto-only playlist (no manual intervention):**
+```json
+{
+  "playlist_name": "Dave Songs of the Day 2026 - Auto",
+  "cooldown_entries": 90,
+  "selection_mode": "weighted_random"
+}
+```
+
+**Most-played, no cooldown (for a relative):**
+```json
+{
+  "playlist_name": "Bob Songs of the Day 2026",
+  "cooldown_entries": 0,
+  "selection_mode": "most_played"
+}
+```
 
 ---
 
@@ -131,15 +199,17 @@ Add to crontab (`crontab -e`):
 
 ```bash
 CRON_TZ=America/New_York
+SCRIPT=/home/ec2-user/src/spotify-tools/song_of_the_day.py
+LOG=/home/ec2-user/logs
 
-# Poll listening history every minute
-* * * * * /path/to/venv/bin/python /path/to/song_of_the_day.py --poll -q >> /var/log/spotify-tools/poll.log 2>&1
+# === Default profile (your main playlist) ===
+* * * * * /usr/bin/python3 $SCRIPT --poll -q >> $LOG/poll.log 2>&1
+55 23 * * * /usr/bin/python3 $SCRIPT --finalize >> $LOG/finalize.log 2>&1
+0 9 * * 0 /usr/bin/python3 $SCRIPT --weekly-summary >> $LOG/summary.log 2>&1
 
-# Finalize at 11:55 PM (add song if none added today)
-55 23 * * * /path/to/venv/bin/python /path/to/song_of_the_day.py --finalize >> /var/log/spotify-tools/finalize.log 2>&1
-
-# Weekly summary on Sundays at 9 AM
-0 9 * * 0 /path/to/venv/bin/python /path/to/song_of_the_day.py --weekly-summary >> /var/log/spotify-tools/summary.log 2>&1
+# === Additional profiles (add as needed) ===
+# * * * * * /usr/bin/python3 $SCRIPT --profile dave-auto --poll -q >> $LOG/dave-auto.log 2>&1
+# 55 23 * * * /usr/bin/python3 $SCRIPT --profile dave-auto --finalize >> $LOG/dave-auto.log 2>&1
 ```
 
 ### Headless Server (EC2) Setup

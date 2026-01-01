@@ -40,7 +40,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 
-from spotify_auth import get_spotify_client, get_state_dir, get_current_user_display
+from spotify_auth import (
+    get_spotify_client, 
+    get_state_dir, 
+    get_current_user_display,
+    set_profile,
+    get_profile,
+)
 
 
 # =============================================================================
@@ -51,8 +57,9 @@ DEFAULT_CONFIG = {
     "playlist_name": "Dave Songs of the Day 2026",
     "playlist_id": None,  # Populated on first run after lookup
     "timezone": "America/New_York",
-    "cooldown_entries": 90,  # Songs can't repeat until 90 others added
+    "cooldown_entries": 90,  # Songs can't repeat until 90 others added (0 = no cooldown)
     "min_duration_ms": 50_000,  # 50 seconds minimum
+    "selection_mode": "weighted_random",  # "weighted_random" or "most_played"
     # Email settings (optional - notifications disabled if not configured)
     "email_enabled": False,
     "email_to": None,  # Recipient address
@@ -808,17 +815,22 @@ def get_candidates_from_days(
     return candidates, eligible_counts
 
 
-def select_song_weighted(
+def select_song_from_candidates(
     candidates: List[Dict[str, Any]], 
     play_counts: Dict[str, int],
+    selection_mode: str = "weighted_random",
     top_n: int = 5
 ) -> Optional[Dict[str, Any]]:
     """
-    Select a song using weighted random from top candidates.
+    Select a song from candidates based on selection mode.
+    
+    Modes:
+        - "weighted_random": Top N by play count, weighted random selection
+        - "most_played": Always pick the single most-played track
     
     1. Rank by play count (descending), then by most recent play
-    2. Take top N candidates
-    3. Select randomly, weighted by play count
+    2. For weighted_random: take top N, select randomly weighted by play count
+    3. For most_played: just return the top one
     """
     if not candidates:
         return None
@@ -831,6 +843,11 @@ def select_song_weighted(
     
     ranked = sorted(candidates, key=sort_key, reverse=True)
     
+    # For "most_played" mode, just return the top track
+    if selection_mode == "most_played":
+        return ranked[0]
+    
+    # For "weighted_random" mode (default)
     # Take top N
     top_candidates = ranked[:top_n]
     
@@ -895,11 +912,16 @@ def select_song(
     
     cooldown = config.get("cooldown_entries", 90)
     min_duration = config.get("min_duration_ms", 50_000)
+    selection_mode = config.get("selection_mode", "weighted_random")
     
     cooldown_ids = get_cooldown_track_ids(snapshot, cooldown)
     
     if verbose:
-        print(f"  Cooldown: {len(cooldown_ids)} tracks in last {cooldown} entries")
+        if cooldown > 0:
+            print(f"  Cooldown: {len(cooldown_ids)} tracks in last {cooldown} entries")
+        else:
+            print(f"  Cooldown: disabled (repeats allowed)")
+        print(f"  Selection mode: {selection_mode}")
     
     # Fallback cascade
     fallback_levels = [
@@ -921,7 +943,9 @@ def select_song(
             print(f"    Found {len(candidates)} eligible candidates")
         
         if candidates:
-            selected = select_song_weighted(candidates, play_counts)
+            selected = select_song_from_candidates(
+                candidates, play_counts, selection_mode=selection_mode
+            )
             if selected:
                 count = play_counts.get(selected["track_id"], 1)
                 if verbose:
@@ -1304,12 +1328,12 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --poll              # Record listening history (run every minute)
-  %(prog)s --status            # Poll + show today's stats (always fresh)
-  %(prog)s --status --no-poll  # Show cached stats without polling
-  %(prog)s --finalize          # Add song if none added today (run nightly)
-  %(prog)s --dry-run           # Test finalize without modifying playlist
-  %(prog)s --weekly-summary    # Email summary of this week's songs
+  %(prog)s --poll                       # Record listening history (run every minute)
+  %(prog)s --status                     # Poll + show today's stats (always fresh)
+  %(prog)s --finalize                   # Add song if none added today (run nightly)
+  %(prog)s --dry-run                    # Test finalize without modifying playlist
+  %(prog)s --weekly-summary             # Email summary of this week's songs
+  %(prog)s --profile dave-auto --poll   # Use a different profile
         """,
     )
     
@@ -1341,6 +1365,12 @@ Examples:
     )
     
     parser.add_argument(
+        "--profile", "-p",
+        type=str,
+        default=None,
+        help="Profile name (default: 'default'). Each profile has its own config and data.",
+    )
+    parser.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress non-essential output",
@@ -1354,10 +1384,15 @@ Examples:
     args = parser.parse_args()
     verbose = not args.quiet
     
+    # Set profile before anything else
+    set_profile(args.profile)
+    
     # Initialize
     config = load_config()
     
     if verbose:
+        profile_name = get_profile()
+        print(f"Profile: {profile_name}")
         print(f"State directory: {get_state_dir()}")
         print(f"Config: {get_config_path()}")
     

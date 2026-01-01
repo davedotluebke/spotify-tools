@@ -41,20 +41,57 @@ DEFAULT_SCOPES = [
 ]
 
 # Default paths
-DEFAULT_STATE_DIR = Path.home() / ".spotify-tools"
-DEFAULT_CACHE_PATH = DEFAULT_STATE_DIR / ".cache"
+DEFAULT_BASE_DIR = Path.home() / ".spotify-tools"
+
+# Module-level state for current profile
+_current_profile: Optional[str] = None
 
 
-def get_state_dir() -> Path:
-    """Return the state directory, creating it if needed."""
-    state_dir = Path(os.getenv("SPOTIFY_STATE_DIR", DEFAULT_STATE_DIR))
+def set_profile(profile: Optional[str]) -> None:
+    """Set the current profile. None means 'default'."""
+    global _current_profile
+    _current_profile = profile
+
+
+def get_profile() -> str:
+    """Get the current profile name."""
+    return _current_profile or "default"
+
+
+def get_state_dir(profile: Optional[str] = None) -> Path:
+    """
+    Return the state directory for a profile, creating it if needed.
+    
+    If profile is None, uses the current profile set via set_profile().
+    
+    For backwards compatibility:
+    - "default" profile uses ~/.spotify-tools/ if config.json exists there
+    - Otherwise uses ~/.spotify-tools/{profile}/
+    """
+    if profile is None:
+        profile = get_profile()
+    
+    # Check for env override first
+    env_override = os.getenv("SPOTIFY_STATE_DIR")
+    if env_override:
+        state_dir = Path(env_override)
+    elif profile == "default":
+        # Backwards compatibility: use base dir if config exists there
+        legacy_config = DEFAULT_BASE_DIR / "config.json"
+        if legacy_config.exists():
+            state_dir = DEFAULT_BASE_DIR
+        else:
+            state_dir = DEFAULT_BASE_DIR / profile
+    else:
+        state_dir = DEFAULT_BASE_DIR / profile
+    
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
 
 
-def get_cache_path() -> Path:
-    """Return the token cache path."""
-    return Path(os.getenv("SPOTIFY_TOKEN_CACHE", DEFAULT_CACHE_PATH))
+def get_cache_path(profile: Optional[str] = None) -> Path:
+    """Return the token cache path for a profile."""
+    return get_state_dir(profile) / ".cache"
 
 
 def load_env() -> None:
