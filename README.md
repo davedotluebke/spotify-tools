@@ -1,28 +1,19 @@
 # Spotify Tools
 
-Personal scripts for interacting with Spotify.
+Personal scripts for managing Spotify playlists automatically.
 
-## Scripts
+## What It Does
 
-### `song_of_the_day.py`
-
-Automatically maintains a "Song of the Day" playlist by adding one song per day based on your listening history. If you manually add a song, it respects that choice. If you forget, it auto-selects from what you listened to that day.
+**`song_of_the_day.py`** maintains a "Song of the Day" playlist by adding one song per day based on your listening history. If you manually add a song, it respects that choice. If you forget, it auto-selects from what you listened to that day.
 
 **Features:**
 - Polls listening history every minute (catches Spotify Jams too)
 - Auto-selects songs using weighted random from your most-played tracks
 - Configurable cooldown prevents repeats (default 90 songs, or disable)
 - Multiple profiles for different playlists/users/rules
+- Auto-creates playlists if they don't exist
 - Tracks whether songs were user-added or auto-picked
 - Optional email notifications (failures + weekly summary)
-
-### `find-by-year.py`
-
-List tracks in a playlist whose album was released in a given year.
-
-```bash
-python find-by-year.py "My Playlist" --year 2025
-```
 
 ---
 
@@ -31,7 +22,7 @@ python find-by-year.py "My Playlist" --year 2025
 ### 1. Install Dependencies
 
 ```bash
-pip install spotipy python-dotenv pytz
+pip install -r requirements.txt
 ```
 
 ### 2. Create Spotify App
@@ -40,20 +31,17 @@ pip install spotipy python-dotenv pytz
 2. Create an app
 3. Add redirect URI: `http://localhost:8080/callback`
 4. Note your Client ID and Client Secret
+5. **For other users**: Add their Spotify email under Settings → User Management
 
 ### 3. Create `.env` File
 
-```bash
-SPOTIFY_CLIENT_ID=your_client_id
-SPOTIFY_CLIENT_SECRET=your_client_secret
-SPOTIFY_REDIRECT_URI=http://localhost:8080/callback
-```
+   ```bash
+   SPOTIFY_CLIENT_ID=your_client_id
+   SPOTIFY_CLIENT_SECRET=your_client_secret
+   SPOTIFY_REDIRECT_URI=http://localhost:8080/callback
+   ```
 
-### 4. Create Your Playlist
-
-Create a playlist in Spotify named exactly as configured (default: "Dave Songs of the Day 2026").
-
-### 5. First Run (Authenticate)
+### 4. First Run (Authenticate)
 
 ```bash
 python song_of_the_day.py --status
@@ -63,9 +51,7 @@ This opens a browser for Spotify login. After authenticating, your token is cach
 
 ---
 
-## Song of the Day Usage
-
-### Commands
+## Commands
 
 | Command | Purpose |
 |---------|---------|
@@ -132,8 +118,8 @@ nano ~/.spotify-tools/uncle-bob/config.json
 
 For a **different Spotify account** (relatives), they need to authenticate once:
 1. Run `--status` with their profile on a machine with a browser
-2. They log in to their Spotify account
-3. Copy the `.cache` file to EC2 if needed
+2. They log in to their Spotify account (use incognito if you're logged into yours)
+3. Copy the `.cache` file to the server if needed
 
 ---
 
@@ -161,7 +147,7 @@ Configuration is stored at `~/.spotify-tools/config.json`. Created automatically
 
 | Setting | Description |
 |---------|-------------|
-| `playlist_name` | Name of your playlist (must exist in Spotify) |
+| `playlist_name` | Name of your playlist (auto-created if doesn't exist) |
 | `playlist_id` | Auto-populated after first lookup |
 | `timezone` | Your timezone for "today" calculations |
 | `cooldown_entries` | Songs can't repeat until this many others added (0 = no cooldown) |
@@ -199,17 +185,15 @@ Add to crontab (`crontab -e`):
 
 ```bash
 CRON_TZ=America/New_York
-SCRIPT=/home/ec2-user/src/spotify-tools/song_of_the_day.py
-LOG=/home/ec2-user/logs
 
-# === Default profile (your main playlist) ===
-* * * * * /usr/bin/python3 $SCRIPT --poll -q >> $LOG/poll.log 2>&1
-55 23 * * * /usr/bin/python3 $SCRIPT --finalize >> $LOG/finalize.log 2>&1
-0 9 * * 0 /usr/bin/python3 $SCRIPT --weekly-summary >> $LOG/summary.log 2>&1
+# === Default profile ===
+* * * * * /usr/bin/python3 /path/to/song_of_the_day.py --poll -q >> ~/logs/poll.log 2>&1
+55 23 * * * /usr/bin/python3 /path/to/song_of_the_day.py --finalize >> ~/logs/finalize.log 2>&1
+0 9 * * 0 /usr/bin/python3 /path/to/song_of_the_day.py --weekly-summary >> ~/logs/summary.log 2>&1
 
-# === Additional profiles (add as needed) ===
-# * * * * * /usr/bin/python3 $SCRIPT --profile dave-auto --poll -q >> $LOG/dave-auto.log 2>&1
-# 55 23 * * * /usr/bin/python3 $SCRIPT --profile dave-auto --finalize >> $LOG/dave-auto.log 2>&1
+# === Additional profiles ===
+* * * * * /usr/bin/python3 /path/to/song_of_the_day.py --profile dave-auto --poll -q >> ~/logs/dave-auto.log 2>&1
+55 23 * * * /usr/bin/python3 /path/to/song_of_the_day.py --profile dave-auto --finalize >> ~/logs/dave-auto.log 2>&1
 ```
 
 ### Headless Server (EC2) Setup
@@ -217,8 +201,10 @@ LOG=/home/ec2-user/logs
 The first authentication requires a browser. To set up on a headless server:
 
 1. Run locally first to complete OAuth flow
-2. Copy `~/.spotify-tools/.cache` to the server
+2. Copy `~/.spotify-tools/.cache` (or `~/.spotify-tools/PROFILE/.cache`) to the server
 3. Token auto-refreshes as long as `.cache` is writable
+
+**For different Spotify accounts**, use incognito mode when authenticating to avoid picking up your own login cookies.
 
 ---
 
@@ -248,6 +234,10 @@ Email notifications are sent for:
 
 ### AWS SES Setup
 
+1. **Verify your domain or email** in SES console
+2. **Create SMTP credentials** in SES → SMTP Settings → Create credentials
+3. **Request production access** if still in sandbox mode (or add recipient emails to verified list)
+
 ```json
 {
   "email_enabled": true,
@@ -269,11 +259,13 @@ Email notifications are sent for:
 1. **Check if user added a song today** — if yes, done
 2. **Build candidate pool** from today's listening history
 3. **Apply eligibility filters**:
-   - Not in last 90 playlist entries (cooldown)
+   - Not in last N playlist entries (cooldown, default 90)
    - Not a podcast episode
    - At least 50 seconds long
 4. **Rank by play count** (most-played first)
-5. **Weighted random selection** from top 5 (more plays = higher chance)
+5. **Select** based on `selection_mode`:
+   - `weighted_random`: Random from top 5, weighted by play count
+   - `most_played`: Always picks the top track
 6. **Fallback cascade** if no eligible songs:
    - Try last 2 days → 3 days → week → Liked Songs
 
@@ -285,7 +277,7 @@ Spotify Jams (collaborative listening sessions) don't appear in the recently-pla
 
 ## State Files
 
-All state is stored in `~/.spotify-tools/`:
+All state is stored in `~/.spotify-tools/` (or `~/.spotify-tools/PROFILE/` for named profiles):
 
 | File | Purpose |
 |------|---------|
@@ -312,10 +304,6 @@ The script requests these Spotify OAuth scopes:
 
 ## Troubleshooting
 
-### "Playlist not found"
-- Ensure the playlist exists in Spotify with the exact name in config
-- The script doesn't auto-create playlists
-
 ### "Permissions missing" error
 - Delete `~/.spotify-tools/.cache` and re-authenticate
 - New scopes may have been added since your last login
@@ -330,8 +318,12 @@ The script requests these Spotify OAuth scopes:
 - For Gmail, ensure you're using an App Password, not your regular password
 - Check SMTP settings match your provider
 
+### 403 "user may not be registered" error
+- Go to developer.spotify.com/dashboard → your app → Settings → User Management
+- Add the user's Spotify email address
+
 ---
 
 ## License
 
-Personal project, not intended for distribution.
+MIT License - see [LICENSE](LICENSE) file.

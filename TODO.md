@@ -311,7 +311,7 @@ CRON_TZ=America/New_York
 
 | Scenario | Handling |
 |----------|----------|
-| Playlist doesn't exist yet | Exit with clear error message; don't auto-create |
+| Playlist doesn't exist yet | Auto-create as private playlist |
 | First run of the year (no history) | Use Liked Songs fallback |
 | User deleted a song from playlist | Detect length decrease, update snapshot, don't re-add |
 | User reordered playlist | Irrelevant; we only care about last 90 by position |
@@ -327,13 +327,13 @@ CRON_TZ=America/New_York
 
 ```
 spotify-tools/
-├── find-by-year.py              # existing script
-├── song_of_the_day.py           # new main script
-├── spotify_auth.py              # shared auth logic (refactored from find-by-year.py)
+├── song_of_the_day.py           # main script
+├── spotify_auth.py              # shared auth logic
 ├── requirements.txt             # spotipy, python-dotenv, pytz
-├── .env                         # SPOTIFY_CLIENT_ID, etc.
+├── .env                         # SPOTIFY_CLIENT_ID, etc. (not committed)
 ├── TODO.md                      # this file
-└── README.md                    # usage instructions
+├── README.md                    # usage instructions
+└── LICENSE                      # MIT license
 ```
 
 ---
@@ -372,23 +372,26 @@ spotify-tools/
 - [x] Add weekly summary email of songs added (`--weekly-summary`)
 - [x] Track user vs auto-added songs in additions.json
 
+### Phase 6: Multi-User Support ✅
+- [x] Profile system (`--profile NAME`) for multiple configurations
+- [x] Each profile has own config, OAuth token, and data directory
+- [x] Configurable `selection_mode`: `weighted_random` or `most_played`
+- [x] Configurable `cooldown_entries`: 0 to disable cooldown
+- [x] Auto-create playlist if it doesn't exist
+- [x] Backwards compatible (default profile uses existing `~/.spotify-tools/`)
+
 ---
 
 ## Open Questions / Future Considerations
 
-1. **What if I want different rules?** — Consider a simple config file or CLI flags for things like:
-   - Cooldown period (default 90)
+1. **Additional selection options** — Consider:
    - Prefer/avoid certain genres
    - Exclude explicit tracks
    - Weight by time of day (evening listens matter more?)
 
-2. **Year rollover** — Script is hardcoded to "2026" playlist. Next year, either:
-   - Parameterize playlist name
-   - Create new script/config for 2027
+2. **Historical backfill** — If you start mid-month, do you want to backfill past dates? Would require stored listening history (or Last.fm integration).
 
-3. **Historical backfill** — If you start this mid-January, do you want to backfill Jan 1-15? Would require stored listening history (or Last.fm integration).
-
-4. **Observability** — Consider a simple SQLite database instead of JSON files for easier querying/debugging.
+3. **Observability** — Consider a simple SQLite database instead of JSON files for easier querying/debugging.
 
 ---
 
@@ -396,8 +399,9 @@ spotify-tools/
 
 ```
 spotipy>=2.23.0
-python-dotenv>=1.0.0
+python-dotenv<1.0.0    # for Python 3.7 compatibility
 pytz>=2024.1
+urllib3<2.0            # for older OpenSSL compatibility
 ```
 
 
