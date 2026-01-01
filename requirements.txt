@@ -1,4 +1,4 @@
 spotipy>=2.23.0
-python-dotenv>=1.0.0
-pytz>=2024.1
+python-dotenv>=0.19.0
+pytz>=2021.1
 
