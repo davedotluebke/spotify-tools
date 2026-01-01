@@ -4,7 +4,7 @@
 
 A daily script that ensures exactly one song is added to the "Dave Songs of the Day 2026" playlist each day. The script:
 
-1. **Polls listening history** hourly throughout the day (cron)
+1. **Polls listening history** every minute throughout the day (cron) — captures both recently-played and currently-playing to catch Spotify Jams
 2. **Runs a nightly check** just before midnight Eastern to see if a song was manually added that day
 3. **Auto-selects a song** if none was added, based on listening data and eligibility rules
 
@@ -16,8 +16,8 @@ A daily script that ensures exactly one song is added to the "Dave Songs of the 
 ┌─────────────────────────────────────────────────────────────────┐
 │                         CRON JOBS                               │
 ├─────────────────────────────────────────────────────────────────┤
-│  Hourly:   song-of-the-day.py --poll                            │
-│  Nightly:  song-of-the-day.py --finalize  (11:55 PM Eastern)    │
+│  Every min: song_of_the_day.py --poll                           │
+│  Nightly:   song_of_the_day.py --finalize  (11:55 PM Eastern)   │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -25,10 +25,12 @@ A daily script that ensures exactly one song is added to the "Dave Songs of the 
 │                      LOCAL STATE (JSON)                         │
 ├─────────────────────────────────────────────────────────────────┤
 │  ~/.spotify-tools/                                              │
-│    ├── daily/                                                   │
-│    │     └── 2026-01-01.json   # all plays for that day         │
+│    ├── .cache                  # OAuth token                    │
+│    ├── config.json             # playlist ID, preferences       │
 │    ├── playlist-snapshot.json  # last known playlist state      │
-│    └── config.json             # playlist ID, preferences       │
+│    ├── additions.json          # tracks user vs auto additions  │
+│    └── daily/                                                   │
+│          └── 2026-01-01.json   # all plays for that day         │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -36,6 +38,7 @@ A daily script that ensures exactly one song is added to the "Dave Songs of the 
 │                     SPOTIFY API (source of truth)               │
 ├─────────────────────────────────────────────────────────────────┤
 │  GET  /me/player/recently-played   (last 50 tracks)             │
+│  GET  /me/player                   (currently playing - Jams)   │
 │  GET  /playlists/{id}/tracks       (current playlist state)     │
 │  POST /playlists/{id}/tracks       (add selected song)          │
 │  GET  /me/tracks                   (Liked Songs fallback)       │
@@ -52,22 +55,25 @@ A daily script that ensures exactly one song is added to the "Dave Songs of the 
 
 | Flag | When | Purpose |
 |------|------|---------|
-| `--poll` | Hourly via cron | Fetch recently-played, append to today's listening log |
+| `--poll` | Every minute via cron | Fetch recently-played + currently-playing, append to today's log |
 | `--finalize` | 11:55 PM Eastern | Check if song was added; if not, pick and add one |
-| `--status` | Manual | Show today's listening stats, playlist state, what would be picked |
+| `--status` | Manual | Poll first, then show today's listening stats and playlist state |
+| `--status --no-poll` | Manual | Show cached stats without polling (faster, for debugging) |
 | `--dry-run` | Manual | Run finalize logic but don't actually add to playlist |
+| `--weekly-summary` | Weekly via cron | Generate and email summary of week's songs (user vs auto) |
 
 ### 2. Local State Files
 
 **`~/.spotify-tools/daily/YYYY-MM-DD.json`**
 
-One file per day, accumulating all plays throughout the day via hourly polls.
+One file per day, accumulating all plays throughout the day via minute-by-minute polls.
 Typically contains a few dozen entries (one per song play, not per poll).
 
 ```json
 {
   "date": "2026-01-01",
   "last_poll": "2026-01-01T22:00:00-05:00",
+  "last_current_track_id": "abc123",
   "plays": [
     {
       "track_id": "abc123",
@@ -76,7 +82,8 @@ Typically contains a few dozen entries (one per song play, not per poll).
       "played_at": "2026-01-01T14:32:00Z",
       "duration_ms": 215000,
       "type": "track",
-      "context_type": "playlist"
+      "context_type": "playlist",
+      "source": "recently_played"
     }
   ],
   "play_counts": {
@@ -85,6 +92,8 @@ Typically contains a few dozen entries (one per song play, not per poll).
   }
 }
 ```
+
+**Note:** `source` is either `"recently_played"` (from Spotify history API) or `"current_playback"` (captured via currently-playing, e.g., during Jams).
 
 **`~/.spotify-tools/playlist-snapshot.json`**
 ```json
@@ -109,11 +118,34 @@ Typically contains a few dozen entries (one per song play, not per poll).
 ```json
 {
   "playlist_name": "Dave Songs of the Day 2026",
-  "playlist_id": null,  // populated on first run after lookup
+  "playlist_id": null,
   "timezone": "America/New_York",
-  "cooldown_entries": 90
+  "cooldown_entries": 90,
+  "min_duration_ms": 50000,
+  "email_enabled": false,
+  "email_to": "you@example.com",
+  "email_from": "sender@example.com",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user": "sender@example.com",
+  "smtp_pass": "your-app-password"
 }
 ```
+
+**`~/.spotify-tools/additions.json`** (tracks user vs auto additions)
+```json
+[
+  {
+    "date": "2026-01-01",
+    "track_id": "abc123",
+    "track_name": "Song Title",
+    "artist": "Artist Name",
+    "source": "user",
+    "recorded_at": "2026-01-01T23:55:00+00:00"
+  }
+]
+```
+`source` is either `"user"` (manually added) or `"auto"` (script-added).
 
 ---
 
@@ -122,6 +154,7 @@ Typically contains a few dozen entries (one per song play, not per poll).
 ```python
 SCOPES = [
     "user-read-recently-played",   # for listening history
+    "user-read-playback-state",    # for currently-playing (catches Jams)
     "playlist-read-private",       # to read playlist contents
     "playlist-modify-private",     # to add tracks (if playlist is private)
     "playlist-modify-public",      # to add tracks (if playlist is public)
@@ -216,6 +249,7 @@ Update local snapshot with new track.
 
 ## Polling Logic (`--poll`)
 
+### Source 1: Recently Played
 1. Fetch `/me/player/recently-played` (limit=50)
 2. Filter to plays where `played_at` is today (Eastern time)
 3. Load today's file from `~/.spotify-tools/daily/YYYY-MM-DD.json` (or create if first poll of day)
@@ -223,14 +257,27 @@ Update local snapshot with new track.
    - Each play has a unique `played_at` ISO timestamp
    - Use `played_at` as the dedup key to avoid double-counting
    - Only append plays whose `played_at` is not already in the file
-   - This handles overlapping windows between hourly polls
-5. Recompute `play_counts` from the merged `plays` array
-6. Update `last_poll` timestamp
-7. Save file
+   - This handles overlapping windows between polls
+5. Mark with `source: "recently_played"`
 
-**Important:** The merge step is critical. Spotify's recently-played returns the last 50 plays regardless of when we last polled. If we poll at 2pm and 3pm, both responses may include plays from 1:30pm. We must dedupe by `played_at` to get accurate play counts.
+### Source 2: Currently Playing
+6. Fetch `/me/player` (current playback state)
+7. If a track is playing and differs from `last_current_track_id`:
+   - Check if we've already recorded this track within last 5 minutes (dedup)
+   - If not, record as new play with current timestamp
+   - Mark with `source: "current_playback"`
+   - Update `last_current_track_id`
 
-**Note:** Spotify's recently-played only returns last 50 tracks. Hourly polling minimizes gaps but some plays may be missed if user listens to 50+ unique tracks in an hour (unlikely).
+### Finalize
+8. Recompute `play_counts` from the merged `plays` array
+9. Update `last_poll` timestamp
+10. Save file
+
+**Why two sources?** Spotify Jams (collaborative listening sessions) don't appear in recently-played history. The currently-playing endpoint catches these plays.
+
+**Dedup logic:** To avoid double-counting when a song appears in both sources, we check if we've already recorded that track_id within the last 5 minutes before adding a currently-playing entry.
+
+**Note:** 1-minute polling is recommended to avoid missing plays during Jams (songs can be as short as 2-3 minutes).
 
 ---
 
@@ -241,12 +288,20 @@ Update local snapshot with new track.
 # Option 1: Set TZ in crontab
 CRON_TZ=America/New_York
 
-# Poll listening history hourly
-0 * * * * /path/to/venv/bin/python /path/to/song_of_the_day.py --poll >> /var/log/spotify-tools/poll.log 2>&1
+# Poll listening history every minute (captures Spotify Jams)
+# Use -q (quiet) to reduce log noise
+* * * * * /path/to/venv/bin/python /path/to/song_of_the_day.py --poll -q >> /var/log/spotify-tools/poll.log 2>&1
 
 # Nightly finalize at 11:55 PM Eastern
 55 23 * * * /path/to/venv/bin/python /path/to/song_of_the_day.py --finalize >> /var/log/spotify-tools/finalize.log 2>&1
+
+# Weekly summary email on Sundays at 9 AM Eastern
+0 9 * * 0 /path/to/venv/bin/python /path/to/song_of_the_day.py --weekly-summary >> /var/log/spotify-tools/summary.log 2>&1
 ```
+
+**Note:** 1-minute polling is needed to capture Spotify Jams, which don't show up in the recently-played API. This makes ~1,440 API calls/day, well within Spotify's limits.
+
+**Note:** Email notifications require `email_enabled: true` and SMTP settings in config.json. For Gmail, use an [App Password](https://support.google.com/accounts/answer/185833).
 
 **Alternative:** systemd timers (more robust, better logging)
 
@@ -262,7 +317,7 @@ CRON_TZ=America/New_York
 | User reordered playlist | Irrelevant; we only care about last 90 by position |
 | Duplicate track IDs in history | Dedupe in play_counts |
 | Token expired | Spotipy handles refresh; ensure `.cache` is writable |
-| Network failure | Log error, exit non-zero; cron will retry next hour/day |
+| Network failure | Log error, exit non-zero; cron will retry next minute |
 | Multiple songs added in one day | Take no action; user is in control |
 | Script runs twice in same minute | Idempotent; check playlist state before adding |
 
@@ -285,34 +340,37 @@ spotify-tools/
 
 ## Implementation Order
 
-### Phase 1: Core Infrastructure
-- [ ] Extract shared auth code into `spotify_auth.py`
-- [ ] Create config/state directory structure (`~/.spotify-tools/`)
-- [ ] Implement `--poll` mode: fetch and store listening history
-- [ ] Test polling over a few hours to verify data capture
+### Phase 1: Core Infrastructure ✅
+- [x] Extract shared auth code into `spotify_auth.py`
+- [x] Create config/state directory structure (`~/.spotify-tools/`)
+- [x] Implement `--poll` mode: fetch and store listening history
+- [x] Add currently-playing capture (for Spotify Jams)
+- [x] Test polling to verify data capture
 
-### Phase 2: Playlist Integration  
-- [ ] Implement playlist lookup by name
-- [ ] Implement playlist snapshot (read current tracks)
-- [ ] Implement "did user add a song today?" detection
-- [ ] Implement `--status` mode for debugging
+### Phase 2: Playlist Integration ✅
+- [x] Implement playlist lookup by name
+- [x] Implement playlist snapshot (read current tracks)
+- [x] Implement "did user add a song today?" detection
+- [x] Implement `--status` mode for debugging
 
-### Phase 3: Selection Algorithm
-- [ ] Implement eligibility filter (90-entry cooldown)
-- [ ] Implement ranking (play count + recency)
-- [ ] Implement fallback cascade (2 days → 3 days → week → Liked Songs)
-- [ ] Implement `--dry-run` mode
+### Phase 3: Selection Algorithm ✅
+- [x] Implement eligibility filter (90-entry cooldown, duration, type)
+- [x] Implement ranking (play count + recency)
+- [x] Implement weighted random selection from top 5
+- [x] Implement fallback cascade (2 days → 3 days → week → Liked Songs)
+- [x] Implement `--dry-run` mode
 
-### Phase 4: Finalize & Deploy
-- [ ] Implement `--finalize` mode (full flow + add to playlist)
+### Phase 4: Finalize & Deploy ✅
+- [x] Implement `--finalize` mode (full flow + add to playlist)
 - [ ] Add logging (file-based, with rotation)
 - [ ] Write deployment instructions for EC2 cron
-- [ ] Test end-to-end with real playlist
+- [x] Test end-to-end with real playlist
 
-### Phase 5: Polish (Optional)
+### Phase 5: Polish ✅
 - [ ] Add `--backfill YYYY-MM-DD` mode to manually trigger for a past date
-- [ ] Add Discord/email notification on failure
-- [ ] Add weekly summary email of songs added
+- [x] Add email notification on failure (auto-sends if email configured)
+- [x] Add weekly summary email of songs added (`--weekly-summary`)
+- [x] Track user vs auto-added songs in additions.json
 
 ---
 
@@ -342,11 +400,4 @@ python-dotenv>=1.0.0
 pytz>=2024.1
 ```
 
----
 
-## Next Steps
-
-1. Review this plan and flag any changes
-2. I'll implement Phase 1 (auth refactor + polling)
-3. Test polling for a day
-4. Continue with Phases 2-4
