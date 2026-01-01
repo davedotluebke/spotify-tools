@@ -543,12 +543,13 @@ def find_playlist_by_name(sp, name: str) -> Optional[Dict[str, Any]]:
     return candidate
 
 
-def get_playlist_id(sp, config: Dict[str, Any]) -> Optional[str]:
+def get_playlist_id(sp, config: Dict[str, Any], create_if_missing: bool = True) -> Optional[str]:
     """
     Get the playlist ID, looking it up by name if not cached.
     
     Caches the ID in config.json for future runs.
-    Returns None if playlist not found.
+    If create_if_missing is True and playlist doesn't exist, creates it.
+    Returns None if playlist not found and create_if_missing is False.
     """
     # Use cached ID if available
     if config.get("playlist_id"):
@@ -560,6 +561,20 @@ def get_playlist_id(sp, config: Dict[str, Any]) -> Optional[str]:
         return None
     
     playlist = find_playlist_by_name(sp, playlist_name)
+    
+    # Create playlist if it doesn't exist
+    if not playlist and create_if_missing:
+        print(f"📝 Playlist '{playlist_name}' not found, creating it...")
+        user_id = sp.current_user()["id"]
+        new_playlist = sp.user_playlist_create(
+            user_id,
+            playlist_name,
+            public=False,
+            description="Daily song picks - auto-managed by song_of_the_day.py"
+        )
+        playlist = new_playlist
+        print(f"✅ Created playlist: {playlist_name}")
+    
     if not playlist:
         return None
     
