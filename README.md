@@ -2,9 +2,11 @@
 
 Personal scripts for managing Spotify playlists automatically.
 
-## What It Does
+## Scripts
 
-**`song_of_the_day.py`** maintains a "Song of the Day" playlist by adding one song per day based on your listening history. If you manually add a song, it respects that choice. If you forget, it auto-selects from what you listened to that day.
+### `song_of_the_day.py`
+
+Maintains a "Song of the Day" playlist by adding one song per day based on your listening history. If you manually add a song, it respects that choice. If you forget, it auto-selects from what you listened to that day.
 
 **Features:**
 - Polls listening history every minute (catches Spotify Jams too)
@@ -14,6 +16,18 @@ Personal scripts for managing Spotify playlists automatically.
 - Auto-creates playlists if they don't exist
 - Tracks whether songs were user-added or auto-picked
 - Optional email notifications (failures + weekly summary)
+
+### `liked_songs_by_country.py`
+
+Sorts your Liked Songs into country-specific playlists based on artist nationality (e.g., "Liked Songs - Japan", "Liked Songs - Germany").
+
+**Features:**
+- Creates one playlist per country automatically
+- Uses MusicBrainz for artist country lookup (free, no API key)
+- Falls back to OpenAI for artists not in MusicBrainz
+- Runs incrementally — only processes new liked songs
+- Handles collaborations: songs with artists from multiple countries go into multiple playlists
+- Caches artist lookups to minimize API calls
 
 ---
 
@@ -39,7 +53,10 @@ pip install -r requirements.txt
    SPOTIFY_CLIENT_ID=your_client_id
    SPOTIFY_CLIENT_SECRET=your_client_secret
    SPOTIFY_REDIRECT_URI=http://localhost:8080/callback
-   ```
+
+# Optional: for liked_songs_by_country.py OpenAI fallback
+OPENAI_API_KEY=sk-...
+```
 
 ### 4. First Run (Authenticate)
 
@@ -321,6 +338,79 @@ The script requests these Spotify OAuth scopes:
 ### 403 "user may not be registered" error
 - Go to developer.spotify.com/dashboard → your app → Settings → User Management
 - Add the user's Spotify email address
+
+---
+
+---
+
+## Liked Songs by Country
+
+### Setup
+
+Add your OpenAI API key to `.env` (for fallback lookups):
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+### Commands
+
+```bash
+# Process all new liked songs
+python liked_songs_by_country.py
+
+# Dry run (show what would happen)
+python liked_songs_by_country.py --dry-run
+
+# Show statistics
+python liked_songs_by_country.py --status
+
+# Debug: look up a single artist
+python liked_songs_by_country.py --lookup-artist "Hikaru Utada"
+
+# Skip OpenAI fallback (MusicBrainz only)
+python liked_songs_by_country.py --no-openai
+
+# Verbose output
+python liked_songs_by_country.py -v
+```
+
+### How It Works
+
+1. Fetches all your Liked Songs from Spotify
+2. Filters to songs not yet processed
+3. For each artist, looks up their country:
+   - **Cache**: Previously looked-up artists are cached
+   - **MusicBrainz**: Free music database with artist origin data
+   - **OpenAI**: Fallback for artists not in MusicBrainz
+4. Creates playlists like "Liked Songs - Japan" as needed
+5. Adds songs to appropriate country playlists
+6. Marks songs as processed (won't be re-processed next run)
+
+### Collaboration Handling
+
+- **Single artist**: Goes to that artist's country playlist
+- **Multiple artists, same country**: Goes to one playlist
+- **Multiple artists, different countries**: Goes to multiple playlists
+  - e.g., a US artist ft. Korean artist → both "Liked Songs - United States" and "Liked Songs - South Korea"
+
+### State Files
+
+Stored in `~/.spotify-tools/country-playlists/`:
+
+| File | Purpose |
+|------|---------|
+| `artist-countries.json` | Cached artist → country lookups |
+| `processed-songs.json` | Track IDs already sorted |
+| `playlist-ids.json` | Country → playlist ID mapping |
+
+### Cron Setup (Optional)
+
+Run weekly to catch new liked songs:
+
+```bash
+0 3 * * 0 /usr/bin/python3 /path/to/liked_songs_by_country.py >> ~/logs/country-playlists.log 2>&1
+```
 
 ---
 
