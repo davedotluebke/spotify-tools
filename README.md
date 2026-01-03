@@ -380,12 +380,14 @@ python liked_songs_by_country.py -v
 1. Fetches all your Liked Songs from Spotify
 2. Filters to songs not yet processed
 3. For each artist, looks up their country:
-   - **Cache**: Previously looked-up artists are cached
-   - **MusicBrainz**: Free music database with artist origin data
-   - **OpenAI**: Fallback for artists not in MusicBrainz
+   - **Cache**: Previously looked-up artists are cached permanently
+   - **MusicBrainz**: Free music database (only used when artist has direct country data)
+   - **OpenAI**: Handles artists MusicBrainz can't resolve (cities, regions, or missing data)
 4. Creates playlists like "Liked Songs - Japan" as needed
 5. Adds songs to appropriate country playlists
 6. Marks songs as processed (won't be re-processed next run)
+
+**Note**: First run may take a while due to MusicBrainz rate limits (1.5 sec between requests). Subsequent runs are fast since artist data is cached.
 
 ### Collaboration Handling
 

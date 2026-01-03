@@ -42,7 +42,7 @@ MUSICBRAINZ_USER_AGENT = "SpotifyCountryPlaylists/1.0 (https://github.com/davedo
 MUSICBRAINZ_API_BASE = "https://musicbrainz.org/ws/2"
 MUSICBRAINZ_RATE_LIMIT = 1.0  # seconds between requests
 
-# Country name normalization map
+# Country name normalization map (for variations, not cities)
 COUNTRY_ALIASES = {
     "United States of America": "United States",
     "USA": "United States",
@@ -69,8 +69,8 @@ COUNTRY_ALIASES = {
     "Brasil": "Brazil",
     "España": "Spain",
     "Italia": "Italy",
-    "France": "France",  # No alias needed, but included for completeness
 }
+
 
 
 # =============================================================================
@@ -257,15 +257,18 @@ def add_tracks_to_playlist(sp, playlist_id: str, track_ids: List[str]) -> None:
 _last_musicbrainz_request = 0.0
 
 
-def musicbrainz_request(endpoint: str, params: Dict[str, str]) -> Optional[Dict]:
-    """Make a rate-limited request to MusicBrainz API."""
+def musicbrainz_request(endpoint: str, params: Dict[str, str] = None) -> Optional[Dict]:
+    """Make a rate-limited request to MusicBrainz API. Returns None on any error."""
     global _last_musicbrainz_request
     
-    # Rate limiting
+    # Rate limiting - be conservative
     elapsed = time.time() - _last_musicbrainz_request
-    if elapsed < MUSICBRAINZ_RATE_LIMIT:
-        time.sleep(MUSICBRAINZ_RATE_LIMIT - elapsed)
+    min_wait = 1.5
+    if elapsed < min_wait:
+        time.sleep(min_wait - elapsed)
     
+    if params is None:
+        params = {}
     params["fmt"] = "json"
     headers = {"User-Agent": MUSICBRAINZ_USER_AGENT}
     
@@ -276,14 +279,13 @@ def musicbrainz_request(endpoint: str, params: Dict[str, str]) -> Optional[Dict]
         
         if response.status_code == 200:
             return response.json()
-        elif response.status_code == 503:
-            # Rate limited, wait and retry
-            time.sleep(2)
-            return musicbrainz_request(endpoint, params)
         else:
+            # Any error - just return None and let OpenAI handle it
             return None
     except requests.RequestException:
+        # Connection error, timeout, etc. - let OpenAI handle it
         return None
+
 
 
 def lookup_artist_musicbrainz(artist_name: str, spotify_id: str = None) -> Optional[str]:
@@ -291,9 +293,10 @@ def lookup_artist_musicbrainz(artist_name: str, spotify_id: str = None) -> Optio
     Look up an artist's country via MusicBrainz.
     
     Returns normalized country name or None if not found.
+    Only returns a result if MusicBrainz has a Country-type area.
+    For cities/regions, returns None to let OpenAI handle it (avoids extra API calls).
     """
     # Search for artist by name (simple search, not strict field match)
-    # This handles cases where artist names differ (e.g., "Hikaru Utada" vs "宇多田ヒカル")
     params = {"query": artist_name, "limit": "10"}
     result = musicbrainz_request("artist", params)
     
@@ -304,48 +307,41 @@ def lookup_artist_musicbrainz(artist_name: str, spotify_id: str = None) -> Optio
     if not artists:
         return None
     
-    # Try to find best match
+    # Try to find best match with a Country-type area
     best_match = None
     artist_name_lower = artist_name.lower()
     
     for artist in artists:
         name = artist.get("name", "").lower()
         aliases = [a.get("name", "").lower() for a in artist.get("aliases", [])]
+        area = artist.get("area", {})
+        
+        # Only consider artists with Country-type areas
+        if area.get("type") != "Country":
+            continue
         
         # Exact name match preferred
         if name == artist_name_lower or artist_name_lower in aliases:
-            if artist.get("area"):
-                best_match = artist
-                break
+            best_match = artist
+            break
         
-        # Otherwise take first result with a country-type area
+        # Otherwise take first result with a country
         if not best_match:
-            area = artist.get("area", {})
-            if area.get("type") == "Country":
-                best_match = artist
-    
-    # Fall back to first result with any area
-    if not best_match:
-        for artist in artists:
-            if artist.get("area"):
-                best_match = artist
-                break
+            best_match = artist
     
     if not best_match:
+        # No artist with a Country-type area found
+        # Return None to let OpenAI handle it
         return None
     
     # Extract country from area
     area = best_match.get("area", {})
-    country = area.get("name")
+    area_name = area.get("name")
     
-    # If area is not a country (e.g., a city), we might need to look up the parent
-    # For now, just return what we have - most artist areas are countries
-    area_type = area.get("type", "")
+    if not area_name:
+        return None
     
-    if country:
-        return normalize_country(country)
-    
-    return None
+    return normalize_country(area_name)
 
 
 def normalize_country(country: str) -> str:
@@ -660,6 +656,74 @@ def lookup_artist_cli(artist_name: str, use_openai: bool = True) -> None:
             print("   → Not found / Error")
 
 
+def fix_cache(use_openai: bool = True, verbose: bool = False) -> None:
+    """
+    Re-lookup artists in cache that have non-country values (cities, etc).
+    
+    This fixes entries that were cached before the city→country lookup was added.
+    """
+    cache = load_artist_cache()
+    
+    # Known country names to skip (these are already correct)
+    known_countries = {
+        "United States", "United Kingdom", "Canada", "Australia", "Germany",
+        "France", "Japan", "South Korea", "Italy", "Spain", "Brazil", "Mexico",
+        "Sweden", "Norway", "Denmark", "Finland", "Netherlands", "Belgium",
+        "Austria", "Switzerland", "Ireland", "New Zealand", "Russia", "China",
+        "Taiwan", "India", "Argentina", "Portugal", "Poland", "Czech Republic",
+        "Hungary", "Greece", "Turkey", "South Africa", "Israel", "Jamaica",
+        "Cuba", "Colombia", "Chile", "Peru", "Venezuela", "Philippines",
+        "Indonesia", "Thailand", "Vietnam", "Malaysia", "Singapore",
+        "Nigeria", "Kenya", "Egypt", "Morocco", "Iceland", "Croatia",
+        "Romania", "Ukraine", "Puerto Rico", "North Korea", "Unknown"
+    }
+    
+    # Find entries that need fixing
+    needs_fix = []
+    for artist_id, data in cache.items():
+        country = data.get("country", "")
+        if country and country not in known_countries:
+            needs_fix.append((artist_id, data))
+    
+    if not needs_fix:
+        print("✅ Cache looks good - no city entries found")
+        return
+    
+    print(f"🔧 Found {len(needs_fix)} entries that may be cities (not countries):")
+    for _, data in needs_fix[:10]:
+        print(f"   • {data.get('name')}: {data.get('country')}")
+    if len(needs_fix) > 10:
+        print(f"   ... and {len(needs_fix) - 10} more")
+    
+    print(f"\n🔍 Re-looking up {len(needs_fix)} artists...")
+    
+    fixed = 0
+    for i, (artist_id, data) in enumerate(needs_fix, 1):
+        artist_name = data.get("name", "")
+        old_country = data.get("country", "")
+        
+        if verbose:
+            print(f"   [{i}/{len(needs_fix)}] {artist_name} (was: {old_country})")
+        
+        # Try MusicBrainz again (now with city→country lookup)
+        new_country = lookup_artist_musicbrainz(artist_name)
+        
+        # If still not found and OpenAI enabled, try that
+        if (not new_country or new_country == old_country) and use_openai:
+            new_country = lookup_artist_openai(artist_name)
+        
+        if new_country and new_country != old_country:
+            cache[artist_id]["country"] = new_country
+            cache[artist_id]["source"] = "musicbrainz" if new_country != "Unknown" else "unknown"
+            cache[artist_id]["cached_at"] = datetime.now(timezone.utc).isoformat()
+            fixed += 1
+            if verbose:
+                print(f"      → {new_country}")
+    
+    save_artist_cache(cache)
+    print(f"\n✅ Fixed {fixed} entries")
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -685,6 +749,11 @@ def main() -> int:
         help="Look up a single artist's country (for debugging)"
     )
     parser.add_argument(
+        "--fix-cache",
+        action="store_true",
+        help="Re-lookup cached entries that are cities instead of countries"
+    )
+    parser.add_argument(
         "--no-openai",
         action="store_true",
         help="Disable OpenAI fallback (use MusicBrainz only)"
@@ -703,6 +772,11 @@ def main() -> int:
     # Handle --lookup-artist (doesn't need Spotify auth)
     if args.lookup_artist:
         lookup_artist_cli(args.lookup_artist, use_openai=not args.no_openai)
+        return 0
+    
+    # Handle --fix-cache (doesn't need Spotify auth)
+    if args.fix_cache:
+        fix_cache(use_openai=not args.no_openai, verbose=args.verbose)
         return 0
     
     # Get Spotify client
