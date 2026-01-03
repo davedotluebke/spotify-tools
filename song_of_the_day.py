@@ -38,7 +38,10 @@ from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import time
+
 import pytz
+import requests
 
 from spotify_auth import (
     get_spotify_client, 
@@ -47,6 +50,27 @@ from spotify_auth import (
     set_profile,
     get_profile,
 )
+
+
+def retry_on_timeout(func, retries: int = 3, delay: float = 2.0):
+    """
+    Retry a function on transient network errors (timeouts, connection errors).
+    
+    Returns the function result, or raises the last exception if all retries fail.
+    """
+    last_exception = None
+    for attempt in range(retries):
+        try:
+            return func()
+        except (requests.exceptions.Timeout, 
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout) as e:
+            last_exception = e
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))  # Exponential backoff
+                continue
+            raise
+    raise last_exception
 
 
 # =============================================================================
@@ -331,7 +355,7 @@ def poll_currently_playing(sp, config: Dict[str, Any], log: Dict[str, Any], verb
     now_utc = datetime.now(pytz.UTC)
     
     try:
-        current = sp.current_playback()
+        current = retry_on_timeout(lambda: sp.current_playback())
     except Exception as e:
         if verbose:
             print(f"  Warning: Could not fetch current playback: {e}")
@@ -425,7 +449,8 @@ def poll_listening_history(sp, config: Dict[str, Any], verbose: bool = True) -> 
     existing_played_at = {p["played_at"] for p in log["plays"]}
     
     # === Part 1: Recently played (official history) ===
-    results = sp.current_user_recently_played(limit=50)
+    # Use retry logic for transient network errors
+    results = retry_on_timeout(lambda: sp.current_user_recently_played(limit=50))
     items = results.get("items", [])
     
     if verbose:
