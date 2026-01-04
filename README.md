@@ -371,6 +371,21 @@ python liked_songs_by_country.py --lookup-artist "Hikaru Utada"
 # Skip OpenAI fallback (MusicBrainz only)
 python liked_songs_by_country.py --no-openai
 
+# Use only OpenAI (skip MusicBrainz)
+python liked_songs_by_country.py --openai-only
+
+# Generate markdown report of songs by country
+python liked_songs_by_country.py --report
+
+# Generate report to custom file
+python liked_songs_by_country.py --report my-report.md
+
+# Clear all country playlists (before re-processing)
+python liked_songs_by_country.py --clear-playlists
+
+# Clear artist cache (force re-lookups)
+python liked_songs_by_country.py --clear-cache
+
 # Verbose output
 python liked_songs_by_country.py -v
 ```

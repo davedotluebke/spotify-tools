@@ -167,9 +167,11 @@ def fetch_all_liked_songs(sp) -> List[Dict[str, Any]]:
         for item in items:
             track = item.get("track")
             if track and track.get("id"):
+                album = track.get("album", {})
                 songs.append({
                     "track_id": track["id"],
                     "track_name": track["name"],
+                    "album_name": album.get("name"),
                     "artists": [
                         {"id": a["id"], "name": a["name"]}
                         for a in track.get("artists", [])
@@ -248,6 +250,41 @@ def add_tracks_to_playlist(sp, playlist_id: str, track_ids: List[str]) -> None:
         batch = track_ids[i:i+100]
         uris = [f"spotify:track:{tid}" for tid in batch]
         sp.playlist_add_items(playlist_id, uris)
+
+
+def clear_country_playlists(sp) -> None:
+    """Remove all tracks from all country playlists."""
+    playlist_ids = load_playlist_ids()
+    
+    if not playlist_ids:
+        print("No country playlists found")
+        return
+    
+    print(f"🗑️  Clearing {len(playlist_ids)} country playlists...")
+    
+    for country, playlist_id in sorted(playlist_ids.items()):
+        # Get all tracks in playlist
+        track_ids = list(get_playlist_track_ids(sp, playlist_id))
+        
+        if not track_ids:
+            print(f"   ✓ {country}: already empty")
+            continue
+        
+        # Remove tracks in batches of 100
+        for i in range(0, len(track_ids), 100):
+            batch = track_ids[i:i+100]
+            uris = [f"spotify:track:{tid}" for tid in batch]
+            sp.playlist_remove_all_occurrences_of_items(playlist_id, uris)
+        
+        print(f"   ✓ {country}: removed {len(track_ids)} tracks")
+    
+    # Clear processed songs so they'll be re-added
+    processed_path = get_processed_songs_path()
+    if processed_path.exists():
+        processed_path.unlink()
+        print("   ✓ Cleared processed songs list")
+    
+    print("\n✅ All playlists cleared. Run again to re-populate.")
 
 
 # =============================================================================
@@ -365,10 +402,11 @@ def normalize_country(country: str) -> str:
 # OpenAI Fallback
 # =============================================================================
 
-def lookup_artist_openai(artist_name: str) -> Optional[str]:
+def lookup_artist_openai(artist_name: str, song_name: str = None, album_name: str = None) -> Optional[str]:
     """
     Look up an artist's country via OpenAI API.
     
+    Optionally includes song/album context for better disambiguation.
     Returns normalized country name or None if lookup fails.
     """
     if not OPENAI_AVAILABLE:
@@ -383,6 +421,16 @@ def lookup_artist_openai(artist_name: str) -> Optional[str]:
     try:
         client = OpenAI(api_key=api_key)
         
+        # Build the query with optional context
+        query = f"What country is the musical artist '{artist_name}' from?"
+        if song_name or album_name:
+            context_parts = []
+            if song_name:
+                context_parts.append(f"Song: \"{song_name}\"")
+            if album_name:
+                context_parts.append(f"Album: \"{album_name}\"")
+            query += f" Context: {', '.join(context_parts)}"
+        
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -392,7 +440,7 @@ def lookup_artist_openai(artist_name: str) -> Optional[str]:
                 },
                 {
                     "role": "user", 
-                    "content": f"What country is the musical artist '{artist_name}' from?"
+                    "content": query
                 }
             ],
             max_tokens=50,
@@ -416,10 +464,16 @@ def get_artist_country(
     artist_name: str,
     cache: Dict[str, Dict[str, Any]],
     use_openai: bool = True,
+    openai_only: bool = False,
+    song_name: str = None,
+    album_name: str = None,
     verbose: bool = False
 ) -> Tuple[str, str]:
     """
     Get an artist's country, using cache → MusicBrainz → OpenAI fallback.
+    
+    If openai_only is True, skips MusicBrainz and goes straight to OpenAI.
+    song_name and album_name provide context for better OpenAI disambiguation.
     
     Returns (country, source) tuple.
     """
@@ -431,24 +485,31 @@ def get_artist_country(
     if verbose:
         print(f"   🔍 Looking up: {artist_name}")
     
-    # Try MusicBrainz
-    country = lookup_artist_musicbrainz(artist_name, artist_id)
-    if country and country != "Unknown":
-        source = "musicbrainz"
-        if verbose:
-            print(f"      → {country} (MusicBrainz)")
-    elif use_openai:
-        # Try OpenAI fallback
-        country = lookup_artist_openai(artist_name)
-        source = "openai" if country and country != "Unknown" else "unknown"
-        if verbose:
-            if country and country != "Unknown":
+    country = None
+    source = "unknown"
+    
+    # Try MusicBrainz first (unless openai_only)
+    if not openai_only:
+        country = lookup_artist_musicbrainz(artist_name, artist_id)
+        if country and country != "Unknown":
+            source = "musicbrainz"
+            if verbose:
+                print(f"      → {country} (MusicBrainz)")
+    
+    # Try OpenAI if MusicBrainz didn't find it (or if openai_only)
+    if (not country or country == "Unknown") and use_openai:
+        country = lookup_artist_openai(artist_name, song_name=song_name, album_name=album_name)
+        if country and country != "Unknown":
+            source = "openai"
+            if verbose:
                 print(f"      → {country} (OpenAI)")
-            else:
+        else:
+            country = "Unknown"
+            source = "unknown"
+            if verbose:
                 print(f"      → Unknown")
-    else:
+    elif not country:
         country = "Unknown"
-        source = "unknown"
         if verbose:
             print(f"      → Unknown (MusicBrainz only)")
     
@@ -472,6 +533,7 @@ def determine_countries_for_track(
     track: Dict[str, Any],
     cache: Dict[str, Dict[str, Any]],
     use_openai: bool = True,
+    openai_only: bool = False,
     verbose: bool = False
 ) -> Set[str]:
     """
@@ -481,12 +543,19 @@ def determine_countries_for_track(
     """
     countries = set()
     
+    # Get song/album context for better OpenAI disambiguation
+    song_name = track.get("track_name")
+    album_name = track.get("album_name")
+    
     for artist in track["artists"]:
         country, _ = get_artist_country(
             artist["id"],
             artist["name"],
             cache,
             use_openai=use_openai,
+            openai_only=openai_only,
+            song_name=song_name,
+            album_name=album_name,
             verbose=verbose
         )
         if country and country != "Unknown":
@@ -499,10 +568,13 @@ def process_liked_songs(
     sp,
     dry_run: bool = False,
     use_openai: bool = True,
+    openai_only: bool = False,
     verbose: bool = False
 ) -> Dict[str, int]:
     """
     Process liked songs and add to country playlists.
+    
+    If openai_only is True, skips MusicBrainz and uses OpenAI for all lookups.
     
     Returns dict of {country: num_songs_added}.
     """
@@ -523,6 +595,8 @@ def process_liked_songs(
         return {}
     
     print(f"\n🎵 Processing {len(new_songs)} new songs...")
+    if openai_only:
+        print("   (Using OpenAI only - skipping MusicBrainz)")
     
     # Group songs by country
     country_to_tracks: Dict[str, List[str]] = {}
@@ -535,6 +609,7 @@ def process_liked_songs(
             song, 
             artist_cache, 
             use_openai=use_openai,
+            openai_only=openai_only,
             verbose=verbose
         )
         
@@ -581,6 +656,136 @@ def process_liked_songs(
         save_processed_songs(processed_data)
     
     return results
+
+
+# Country to flag emoji mapping  
+COUNTRY_FLAGS = {
+    'United States': '🇺🇸', 'United Kingdom': '🇬🇧', 'Canada': '🇨🇦',
+    'Germany': '🇩🇪', 'France': '🇫🇷', 'Australia': '🇦🇺', 'Sweden': '🇸🇪',
+    'Japan': '🇯🇵', 'Ireland': '🇮🇪', 'Netherlands': '🇳🇱', 'Belgium': '🇧🇪',
+    'Italy': '🇮🇹', 'New Zealand': '🇳🇿', 'Austria': '🇦🇹', 'South Africa': '🇿🇦',
+    'Norway': '🇳🇴', 'Finland': '🇫🇮', 'Poland': '🇵🇱', 'Iceland': '🇮🇸',
+    'Jamaica': '🇯🇲', 'Mexico': '🇲🇽', 'Mali': '🇲🇱', 'Russia': '🇷🇺',
+    'Denmark': '🇩🇰', 'Ukraine': '🇺🇦', 'Spain': '🇪🇸', 'Colombia': '🇨🇴',
+    'Argentina': '🇦🇷', 'Algeria': '🇩🇿', 'Mongolia': '🇲🇳', 'Chile': '🇨🇱',
+    'Palestine': '🇵🇸', 'Cuba': '🇨🇺', 'Moldova': '🇲🇩', 'Estonia': '🇪🇪',
+    'Switzerland': '🇨🇭', 'Bulgaria': '🇧🇬', 'Romania': '🇷🇴', 'Czechia': '🇨🇿',
+    'Haiti': '🇭🇹', 'Portugal': '🇵🇹', 'India': '🇮🇳', 'Brazil': '🇧🇷',
+    'China': '🇨🇳', 'South Korea': '🇰🇷', 'Taiwan': '🇹🇼', 'Singapore': '🇸🇬',
+    'Thailand': '🇹🇭', 'Indonesia': '🇮🇩', 'Philippines': '🇵🇭', 'Vietnam': '🇻🇳',
+    'Malaysia': '🇲🇾', 'Greece': '🇬🇷', 'Turkey': '🇹🇷', 'Israel': '🇮🇱',
+    'Egypt': '🇪🇬', 'Nigeria': '🇳🇬', 'Kenya': '🇰🇪', 'Morocco': '🇲🇦',
+    'Unknown': '❓'
+}
+
+
+def format_duration(ms: int) -> str:
+    """Format milliseconds as Xh Ym or Ym."""
+    total_seconds = ms // 1000
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    if hours > 0:
+        return f'{hours}h {minutes}m'
+    else:
+        return f'{minutes}m'
+
+
+def generate_country_report(sp, output_file: str) -> None:
+    """Generate a markdown report of liked songs by country."""
+    from collections import defaultdict
+    
+    print("📊 Generating country report...")
+    
+    # Load artist cache
+    artist_cache = load_artist_cache()
+    if not artist_cache:
+        print("❌ No artist data cached. Run the script first to populate.")
+        return
+    
+    # Fetch all liked songs with duration
+    print("   Fetching liked songs...")
+    songs = []
+    offset = 0
+    while True:
+        results = sp.current_user_saved_tracks(limit=50, offset=offset)
+        items = results.get('items', [])
+        if not items:
+            break
+        for item in items:
+            track = item.get('track')
+            if track and track.get('id'):
+                songs.append({
+                    'track_id': track['id'],
+                    'track_name': track['name'],
+                    'duration_ms': track.get('duration_ms', 0),
+                    'artists': [{'id': a['id'], 'name': a['name']} for a in track.get('artists', [])]
+                })
+        offset += 50
+        if len(items) < 50:
+            break
+    
+    print(f"   Found {len(songs)} songs")
+    
+    # Calculate stats per country
+    country_stats = defaultdict(lambda: {'artists': set(), 'songs': 0, 'duration_ms': 0})
+    
+    for song in songs:
+        song_countries = set()
+        for artist in song['artists']:
+            artist_data = artist_cache.get(artist['id'])
+            if artist_data:
+                country = artist_data['country']
+                if country and country != 'Unknown':
+                    song_countries.add(country)
+                    country_stats[country]['artists'].add(artist['id'])
+        
+        # Add song to each country (for collabs)
+        for country in song_countries:
+            country_stats[country]['songs'] += 1
+            country_stats[country]['duration_ms'] += song['duration_ms']
+    
+    # Sort by duration (most listened)
+    sorted_countries = sorted(
+        [(c, s) for c, s in country_stats.items()],
+        key=lambda x: x[1]['duration_ms'],
+        reverse=True
+    )
+    
+    # Generate markdown
+    lines = []
+    lines.append("# Liked Songs by Country")
+    lines.append("")
+    lines.append("*My Liked Songs library, sorted by artist country of origin.*")
+    lines.append("")
+    lines.append("| Flag | Country | Artists | Songs | Duration |")
+    lines.append("|:----:|---------|--------:|------:|---------:|")
+    
+    for country, stats in sorted_countries:
+        flag = COUNTRY_FLAGS.get(country, '🏳️')
+        artists = len(stats['artists'])
+        songs_count = stats['songs']
+        duration = format_duration(stats['duration_ms'])
+        lines.append(f"| {flag} | {country} | {artists} | {songs_count} | {duration} |")
+    
+    # Calculate totals
+    total_artists = len(set(aid for s in country_stats.values() for aid in s['artists']))
+    total_songs = len(songs)
+    total_duration = sum(s['duration_ms'] for s in country_stats.values())
+    unknown_count = sum(1 for a in artist_cache.values() if a.get('country') == 'Unknown')
+    
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"**Total:** {total_songs:,} songs • {total_artists:,} artists • {len(country_stats)} countries • {format_duration(total_duration)}")
+    lines.append("")
+    lines.append(f"*{unknown_count} artists with unknown origin not included above*")
+    lines.append("")
+    
+    # Write to file
+    with open(output_file, 'w') as f:
+        f.write('\n'.join(lines))
+    
+    print(f"✅ Report written to {output_file}")
 
 
 def show_status(sp) -> None:
@@ -759,6 +964,24 @@ def main() -> int:
         help="Disable OpenAI fallback (use MusicBrainz only)"
     )
     parser.add_argument(
+        "--openai-only",
+        action="store_true",
+        help="Skip MusicBrainz, use OpenAI for all lookups (more accurate but costs ~$0.02)"
+    )
+    parser.add_argument(
+        "--clear-playlists",
+        action="store_true",
+        help="Remove all tracks from country playlists (use before re-processing)"
+    )
+    parser.add_argument(
+        "--report",
+        type=str,
+        nargs="?",
+        const="LIKED_SONGS_BY_COUNTRY.md",
+        metavar="FILE",
+        help="Generate markdown report of songs by country (default: LIKED_SONGS_BY_COUNTRY.md)"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Show detailed progress"
@@ -779,7 +1002,7 @@ def main() -> int:
         fix_cache(use_openai=not args.no_openai, verbose=args.verbose)
         return 0
     
-    # Get Spotify client
+    # Get Spotify client (needed for remaining commands)
     sp = get_spotify_client()
     if not sp:
         print("❌ Failed to authenticate with Spotify")
@@ -793,6 +1016,16 @@ def main() -> int:
         print(f"❌ Failed to get user info: {e}")
         return 1
     
+    # Handle --clear-playlists
+    if args.clear_playlists:
+        clear_country_playlists(sp)
+        return 0
+    
+    # Handle --report
+    if args.report:
+        generate_country_report(sp, args.report)
+        return 0
+    
     # Handle modes
     if args.status:
         show_status(sp)
@@ -804,6 +1037,7 @@ def main() -> int:
             sp,
             dry_run=args.dry_run,
             use_openai=not args.no_openai,
+            openai_only=args.openai_only,
             verbose=args.verbose
         )
         
