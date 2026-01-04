@@ -149,6 +149,8 @@ Configuration is stored at `~/.spotify-tools/config.json`. Created automatically
   "playlist_name": "Dave Songs of the Day 2026",
   "playlist_id": null,
   "timezone": "America/New_York",
+  "day_boundary_hour": 4,
+  "year_start_date": null,
   "cooldown_entries": 90,
   "min_duration_ms": 50000,
   "selection_mode": "weighted_random",
@@ -164,9 +166,11 @@ Configuration is stored at `~/.spotify-tools/config.json`. Created automatically
 
 | Setting | Description |
 |---------|-------------|
-| `playlist_name` | Name of your playlist (auto-created if doesn't exist) |
+| `playlist_name` | Name of your playlist (auto-created if doesn't exist). If it contains a year like "2026", that's used for day counting. |
 | `playlist_id` | Auto-populated after first lookup |
-| `timezone` | Your timezone for "today" calculations |
+| `timezone` | Your timezone for day calculations |
+| `day_boundary_hour` | Hour when a new day starts (default 4 = 4am). For night owls who stay up past midnight. |
+| `year_start_date` | First day of the playlist year (default: Jan 1 of year in playlist name, e.g. `"2026-01-01"`) |
 | `cooldown_entries` | Songs can't repeat until this many others added (0 = no cooldown) |
 | `min_duration_ms` | Minimum track length (filters intros/skits) |
 | `selection_mode` | `"weighted_random"` (default) or `"most_played"` (always top track) |
@@ -182,6 +186,15 @@ Configuration is stored at `~/.spotify-tools/config.json`. Created automatically
   "playlist_name": "Dave Songs of the Day 2026 - Auto",
   "cooldown_entries": 90,
   "selection_mode": "weighted_random"
+}
+```
+
+**Night owl who stays up late (day doesn't end until 3am):**
+```json
+{
+  "playlist_name": "Songs of the Day 2026",
+  "day_boundary_hour": 3,
+  "timezone": "America/New_York"
 }
 ```
 
@@ -271,20 +284,46 @@ Email notifications are sent for:
 
 ## How It Works
 
+### Count-Based Logic
+
+The script ensures **playlist count = day of year**:
+- After Jan 1 → 1 song
+- After Jan 3 → 3 songs  
+- After Feb 1 → 32 songs
+- After Dec 31 → 365 (or 366) songs
+
+This means:
+- **Manual additions count** — if you add a song, it counts toward the target
+- **Deleted songs get replaced** — if a song is removed, the script adds another
+- **Catch-up mode** — if behind (script didn't run, songs deleted), it adds multiple songs
+
+### Day Boundary
+
+By default, a new "day" starts at 4am (`day_boundary_hour`). This handles night owls who stay up past midnight. If you run finalize at 2am on Jan 4, it still targets Jan 3's count.
+
 ### Selection Algorithm
 
-1. **Check if user added a song today** — if yes, done
-2. **Build candidate pool** from today's listening history
-3. **Apply eligibility filters**:
+When songs need to be added:
+
+1. **Build candidate pool** from today's listening history
+2. **Apply eligibility filters**:
    - Not in last N playlist entries (cooldown, default 90)
    - Not a podcast episode
    - At least 50 seconds long
-4. **Rank by play count** (most-played first)
-5. **Select** based on `selection_mode`:
+3. **Rank by play count** (most-played first)
+4. **Select** based on `selection_mode`:
    - `weighted_random`: Random from top 5, weighted by play count
    - `most_played`: Always picks the top track
-6. **Fallback cascade** if no eligible songs:
+5. **Fallback cascade** if no eligible songs:
    - Try last 2 days → 3 days → week → Liked Songs
+
+### Nightly Email
+
+After each finalize run, an email is sent (if configured) reporting:
+- Playlist count before/after
+- Target count for the day
+- Songs added (or why none were added)
+- Whether playlist is on track, ahead, or behind
 
 ### Why Minute-by-Minute Polling?
 

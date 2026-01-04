@@ -2,14 +2,18 @@
 """
 Song of the Day - Automatic daily playlist curation.
 
-Ensures exactly one song is added to a "Songs of the Day" playlist each day.
-Polls listening history throughout the day, then auto-selects a song at night
-if none was manually added.
+Maintains a "Songs of the Day" playlist where the song count matches the day of year:
+- After Jan 1 → 1 song
+- After Jan 3 → 3 songs
+- After Dec 31 → 365 songs
+
+Manual additions count toward the target. Deleted songs get replaced automatically.
+Sends a nightly email report (if configured).
 
 Usage:
     song_of_the_day.py --poll              # Record listening history (run every 1-5 min)
-    song_of_the_day.py --finalize          # Nightly: add song if needed
-    song_of_the_day.py --status            # Show today's stats
+    song_of_the_day.py --finalize          # Nightly: ensure correct song count
+    song_of_the_day.py --status            # Show playlist status and targets
     song_of_the_day.py --dry-run           # Test finalize without adding
 
 Polling:
@@ -22,6 +26,9 @@ Polling:
 
 Configuration:
     Edit ~/.spotify-tools/config.json to customize playlist name, timezone, etc.
+    Key settings:
+    - day_boundary_hour: When a new day starts (default 4am, for night owls)
+    - year_start_date: First day of playlist year (inferred from playlist name)
 """
 from __future__ import annotations
 
@@ -84,6 +91,12 @@ DEFAULT_CONFIG = {
     "cooldown_entries": 90,  # Songs can't repeat until 90 others added (0 = no cooldown)
     "min_duration_ms": 50_000,  # 50 seconds minimum
     "selection_mode": "weighted_random",  # "weighted_random" or "most_played"
+    # Day boundary: hour at which new day starts (for night owls who stay up past midnight)
+    # E.g., 4 means the script considers it "yesterday" until 4am
+    "day_boundary_hour": 4,
+    # Year start date: first day of the playlist year (inferred from playlist name if not set)
+    # Format: "YYYY-MM-DD" e.g. "2026-01-01"
+    "year_start_date": None,
     # Email settings (optional - notifications disabled if not configured)
     "email_enabled": False,
     "email_to": None,  # Recipient address
@@ -124,6 +137,77 @@ def save_config(config: Dict[str, Any]) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
+
+
+# =============================================================================
+# Target Song Count Calculation
+# =============================================================================
+
+import re
+
+
+def get_year_start_date(config: Dict[str, Any]) -> date:
+    """
+    Get the date that corresponds to day 1 of the playlist.
+    
+    Priority:
+    1. Explicit year_start_date in config
+    2. Year parsed from playlist name (e.g., "Songs of the Day 2026" → Jan 1, 2026)
+    3. Current year
+    """
+    # Check for explicit config
+    if config.get("year_start_date"):
+        return date.fromisoformat(config["year_start_date"])
+    
+    # Try to infer from playlist name (look for 4-digit year starting with 20)
+    playlist_name = config.get("playlist_name", "")
+    match = re.search(r'\b(20\d{2})\b', playlist_name)
+    if match:
+        year = int(match.group(1))
+        return date(year, 1, 1)
+    
+    # Default to current year
+    tz = pytz.timezone(config.get("timezone", "America/New_York"))
+    return date(datetime.now(tz).year, 1, 1)
+
+
+def get_effective_date(config: Dict[str, Any]) -> date:
+    """
+    Get the "effective date" for playlist targeting.
+    
+    If running before day_boundary_hour (default 4am), considers it
+    still "yesterday" for targeting purposes. This handles night owls
+    who stay up past midnight.
+    """
+    tz = pytz.timezone(config["timezone"])
+    now = datetime.now(tz)
+    
+    day_boundary_hour = config.get("day_boundary_hour", 4)
+    
+    # If before boundary hour, treat as previous day
+    if now.hour < day_boundary_hour:
+        return now.date() - timedelta(days=1)
+    else:
+        return now.date()
+
+
+def get_target_song_count(config: Dict[str, Any]) -> int:
+    """
+    Calculate target number of songs based on day of year.
+    
+    Returns the number of songs the playlist should have after the
+    effective date. E.g., after Jan 3 → 3 songs.
+    """
+    effective_date = get_effective_date(config)
+    year_start = get_year_start_date(config)
+    
+    # Calculate days since year start (1-indexed)
+    # Jan 1 = day 1 → 1 song
+    # Jan 2 = day 2 → 2 songs
+    # etc.
+    days_elapsed = (effective_date - year_start).days + 1
+    
+    return max(0, days_elapsed)
 
 
 # =============================================================================
@@ -195,6 +279,139 @@ Please check the logs and fix the issue.
 """
     
     send_email(config, subject, body)
+
+
+def send_nightly_email(
+    config: Dict[str, Any],
+    effective_date: date,
+    playlist_count_before: int,
+    target_count: int,
+    songs_added: List[Dict[str, Any]],
+    playlist_count_after: int,
+    dry_run: bool = False,
+) -> None:
+    """
+    Send a nightly summary email after finalize runs.
+    
+    Always sends if email is enabled, reporting what happened.
+    """
+    tz = pytz.timezone(config.get("timezone", "America/New_York"))
+    now = datetime.now(tz)
+    
+    # Determine status
+    if dry_run:
+        status_emoji = "🔍"
+        status_text = "DRY RUN"
+    elif playlist_count_after >= target_count:
+        status_emoji = "✅"
+        status_text = "On Track"
+    elif songs_added:
+        status_emoji = "🎵"
+        status_text = f"Added {len(songs_added)} song(s)"
+    else:
+        status_emoji = "⚠️"
+        status_text = "Behind Schedule"
+    
+    subject = f"{status_emoji} Song of the Day — {effective_date.strftime('%b %d')} — {status_text}"
+    
+    # Build body
+    lines = [
+        f"Song of the Day — Nightly Report",
+        f"Date: {effective_date.strftime('%A, %B %d, %Y')} (Day {(effective_date - get_year_start_date(config)).days + 1})",
+        f"Run time: {now.strftime('%Y-%m-%d %H:%M %Z')}",
+        f"Playlist: {config.get('playlist_name', 'Unknown')}",
+        f"",
+        f"{'─' * 50}",
+        f"",
+    ]
+    
+    if dry_run:
+        lines.append("🔍 DRY RUN — No changes made")
+        lines.append("")
+    
+    lines.extend([
+        f"Playlist count before: {playlist_count_before}",
+        f"Target count (day {(effective_date - get_year_start_date(config)).days + 1}): {target_count}",
+        f"Songs needed: {max(0, target_count - playlist_count_before)}",
+        f"",
+    ])
+    
+    if songs_added:
+        lines.append(f"{'Added' if not dry_run else 'Would add'} {len(songs_added)} song(s):")
+        for song in songs_added:
+            lines.append(f"  🎵 {song['track_name']} — {song['artist']}")
+        lines.append("")
+    elif playlist_count_before >= target_count:
+        lines.append("✅ Playlist already at or above target count. No songs added.")
+        lines.append("")
+    else:
+        lines.append("❌ Could not find eligible songs to add!")
+        lines.append("")
+    
+    lines.extend([
+        f"Playlist count after: {playlist_count_after}",
+        f"",
+        f"{'─' * 50}",
+    ])
+    
+    # Add status summary
+    if playlist_count_after >= target_count:
+        diff = playlist_count_after - target_count
+        if diff == 0:
+            lines.append(f"✅ Playlist is exactly on track!")
+        else:
+            lines.append(f"✅ Playlist is {diff} song(s) ahead of schedule")
+    else:
+        diff = target_count - playlist_count_after
+        lines.append(f"⚠️ Playlist is {diff} song(s) behind schedule")
+    
+    body = "\n".join(lines)
+    
+    # HTML version
+    html_lines = [
+        "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif;'>",
+        f"<h2>🎵 Song of the Day — Nightly Report</h2>",
+        f"<p><strong>Date:</strong> {effective_date.strftime('%A, %B %d, %Y')} (Day {(effective_date - get_year_start_date(config)).days + 1})</p>",
+        f"<p><strong>Playlist:</strong> {config.get('playlist_name', 'Unknown')}</p>",
+        "<hr>",
+    ]
+    
+    if dry_run:
+        html_lines.append("<p><em>🔍 DRY RUN — No changes made</em></p>")
+    
+    html_lines.extend([
+        f"<p>Playlist count before: <strong>{playlist_count_before}</strong></p>",
+        f"<p>Target count: <strong>{target_count}</strong></p>",
+    ])
+    
+    if songs_added:
+        html_lines.append(f"<p><strong>{'Added' if not dry_run else 'Would add'} {len(songs_added)} song(s):</strong></p>")
+        html_lines.append("<ul>")
+        for song in songs_added:
+            html_lines.append(f"<li>🎵 <strong>{song['track_name']}</strong> — {song['artist']}</li>")
+        html_lines.append("</ul>")
+    elif playlist_count_before >= target_count:
+        html_lines.append("<p>✅ Playlist already at or above target count. No songs added.</p>")
+    else:
+        html_lines.append("<p>❌ Could not find eligible songs to add!</p>")
+    
+    html_lines.append(f"<p>Playlist count after: <strong>{playlist_count_after}</strong></p>")
+    html_lines.append("<hr>")
+    
+    if playlist_count_after >= target_count:
+        diff = playlist_count_after - target_count
+        if diff == 0:
+            html_lines.append("<p style='color: green;'>✅ Playlist is exactly on track!</p>")
+        else:
+            html_lines.append(f"<p style='color: green;'>✅ Playlist is {diff} song(s) ahead of schedule</p>")
+    else:
+        diff = target_count - playlist_count_after
+        html_lines.append(f"<p style='color: orange;'>⚠️ Playlist is {diff} song(s) behind schedule</p>")
+    
+    html_lines.append("</body></html>")
+    html_body = "\n".join(html_lines)
+    
+    send_email(config, subject, body, html_body)
 
 
 # =============================================================================
@@ -935,7 +1152,8 @@ def select_song(
     sp,
     config: Dict[str, Any],
     snapshot: Dict[str, Any],
-    verbose: bool = True
+    verbose: bool = True,
+    extra_exclude_ids: Optional[set] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Select a song to add to the playlist.
@@ -946,6 +1164,10 @@ def select_song(
     3. Last 3 days
     4. Last week
     5. Liked Songs
+    
+    Args:
+        extra_exclude_ids: Additional track IDs to exclude (e.g., tracks already
+                          added in this run when adding multiple songs)
     """
     tz = pytz.timezone(config["timezone"])
     today = get_today(tz)
@@ -955,6 +1177,10 @@ def select_song(
     selection_mode = config.get("selection_mode", "weighted_random")
     
     cooldown_ids = get_cooldown_track_ids(snapshot, cooldown)
+    
+    # Add extra exclusions if provided
+    if extra_exclude_ids:
+        cooldown_ids = cooldown_ids | extra_exclude_ids
     
     if verbose:
         if cooldown > 0:
@@ -1045,22 +1271,35 @@ def finalize_day(
     verbose: bool = True
 ) -> int:
     """
-    Finalize the day: check if a song was added, and auto-add if not.
+    Finalize the day: ensure playlist has correct number of songs for day of year.
+    
+    Logic:
+    - Calculate target count (day of year = song count)
+    - If playlist count < target, add songs until we reach target
+    - If playlist count >= target, do nothing
+    
+    This approach means:
+    - Manual additions count toward the target
+    - Deleted songs get replaced
+    - If you're behind (e.g., script didn't run), it catches up
     
     Returns exit code: 0 for success, 1 for error.
     """
     tz = pytz.timezone(config["timezone"])
-    today = get_today(tz)
     now = datetime.now(tz)
+    effective_date = get_effective_date(config)
+    target_count = get_target_song_count(config)
+    year_start = get_year_start_date(config)
+    day_number = (effective_date - year_start).days + 1
     
     if verbose:
-        print(f"Finalizing {today} at {now.strftime('%H:%M')} {config['timezone']}")
+        print(f"Finalizing for {effective_date} (Day {day_number}) at {now.strftime('%H:%M')} {config['timezone']}")
         if dry_run:
             print("  (DRY RUN - no changes will be made)\n")
         else:
             print()
     
-    # Check playlist state
+    # Get playlist
     playlist_id = get_playlist_id(sp, config)
     if not playlist_id:
         print(f"❌ Playlist '{config['playlist_name']}' not found!", file=sys.stderr)
@@ -1070,75 +1309,134 @@ def finalize_day(
         print(f"Playlist: {config['playlist_name']}")
         print(f"Playlist ID: {playlist_id}")
     
-    # Detect if song was already added today
-    detection = detect_daily_addition(sp, config, verbose=verbose)
-    
-    if detection.get("error"):
-        print(f"❌ Error: {detection['error']}", file=sys.stderr)
+    # Get current playlist state
+    snapshot = take_playlist_snapshot(sp, config)
+    if not snapshot:
+        print(f"❌ Could not fetch playlist!", file=sys.stderr)
         return 1
     
-    if detection["added_today"]:
+    playlist_count_before = snapshot["track_count"]
+    songs_needed = target_count - playlist_count_before
+    
+    if verbose:
+        print(f"\nPlaylist count: {playlist_count_before}")
+        print(f"Target count (Day {day_number}): {target_count}")
+        print(f"Songs needed: {max(0, songs_needed)}")
+    
+    # Track what we add
+    songs_added: List[Dict[str, Any]] = []
+    extra_exclude_ids: set = set()
+    
+    if songs_needed <= 0:
         if verbose:
-            print(f"\n✅ Song already added today:")
-            for t in detection["todays_tracks"]:
-                print(f"   → {t['track_name']} — {t['artist']}")
-            print(f"\nNo action needed.")
-        
-        # Record user additions (if not already recorded)
-        for t in detection["todays_tracks"]:
-            record_addition(
-                track_id=t["track_id"],
-                track_name=t["track_name"],
-                artist=t["artist"],
-                source="user",
-                date_added=today,
-            )
-        
-        return 0
-    
-    # Need to select and add a song
-    if verbose:
-        print(f"\n❌ No song added today. Selecting one...")
-    
-    snapshot = detection["current_snapshot"]
-    selected = select_song(sp, config, snapshot, verbose=verbose)
-    
-    if not selected:
-        print(f"\n❌ Could not find any eligible song to add!", file=sys.stderr)
-        return 1
-    
-    if verbose:
-        print(f"\n🎵 Selected: {selected['track_name']} — {selected['artist']}")
-    
-    if dry_run:
-        print(f"\n(DRY RUN) Would add: {selected['track_name']} — {selected['artist']}")
-        return 0
-    
-    # Actually add the track
-    if verbose:
-        print(f"  Adding to playlist...")
-    
-    success = add_track_to_playlist(sp, playlist_id, selected["track_id"])
-    
-    if success:
-        if verbose:
-            print(f"\n✅ Successfully added: {selected['track_name']} — {selected['artist']}")
-        
-        # Record this auto-addition
-        record_addition(
-            track_id=selected["track_id"],
-            track_name=selected["track_name"],
-            artist=selected["artist"],
-            source="auto",
-            date_added=today,
-        )
-        
-        # Update snapshot to reflect the new track
-        take_playlist_snapshot(sp, config)
-        
-        return 0
+            if songs_needed == 0:
+                print(f"\n✅ Playlist is exactly on track!")
+            else:
+                print(f"\n✅ Playlist is {-songs_needed} song(s) ahead of schedule")
+            print(f"No action needed.")
     else:
+        if verbose:
+            print(f"\n🎵 Need to add {songs_needed} song(s)...")
+        
+        # Add songs one at a time until we reach target or run out of candidates
+        for i in range(songs_needed):
+            if verbose:
+                print(f"\n--- Selecting song {i + 1} of {songs_needed} ---")
+            
+            # Re-fetch snapshot if we've added songs (to update cooldown correctly)
+            if songs_added and not dry_run:
+                snapshot = take_playlist_snapshot(sp, config)
+            
+            selected = select_song(
+                sp, config, snapshot, 
+                verbose=verbose, 
+                extra_exclude_ids=extra_exclude_ids
+            )
+            
+            if not selected:
+                print(f"\n⚠️ Could not find eligible song #{i + 1}. Stopping.", file=sys.stderr)
+                break
+            
+            if verbose:
+                print(f"\n🎵 Selected: {selected['track_name']} — {selected['artist']}")
+            
+            if dry_run:
+                print(f"  (DRY RUN) Would add: {selected['track_name']} — {selected['artist']}")
+                songs_added.append(selected)
+                extra_exclude_ids.add(selected["track_id"])
+            else:
+                if verbose:
+                    print(f"  Adding to playlist...")
+                
+                success = add_track_to_playlist(sp, playlist_id, selected["track_id"])
+                
+                if success:
+                    if verbose:
+                        print(f"  ✅ Added: {selected['track_name']} — {selected['artist']}")
+                    
+                    songs_added.append(selected)
+                    extra_exclude_ids.add(selected["track_id"])
+                    
+                    # Record this auto-addition
+                    record_addition(
+                        track_id=selected["track_id"],
+                        track_name=selected["track_name"],
+                        artist=selected["artist"],
+                        source="auto",
+                        date_added=effective_date,
+                    )
+                else:
+                    print(f"  ❌ Failed to add track!", file=sys.stderr)
+                    break
+    
+    # Get final count
+    if songs_added and not dry_run:
+        final_snapshot = take_playlist_snapshot(sp, config)
+        playlist_count_after = final_snapshot["track_count"] if final_snapshot else playlist_count_before + len(songs_added)
+    else:
+        playlist_count_after = playlist_count_before + (len(songs_added) if dry_run else 0)
+    
+    # Summary
+    if verbose:
+        print(f"\n{'=' * 50}")
+        print(f"Summary:")
+        print(f"  Before: {playlist_count_before} songs")
+        print(f"  Added: {len(songs_added)} song(s)")
+        print(f"  After: {playlist_count_after} songs")
+        print(f"  Target: {target_count} songs")
+        
+        if playlist_count_after >= target_count:
+            diff = playlist_count_after - target_count
+            if diff == 0:
+                print(f"\n✅ Playlist is exactly on track!")
+            else:
+                print(f"\n✅ Playlist is {diff} song(s) ahead of schedule")
+        else:
+            diff = target_count - playlist_count_after
+            print(f"\n⚠️ Playlist is still {diff} song(s) behind schedule")
+    
+    # Send nightly email
+    send_nightly_email(
+        config=config,
+        effective_date=effective_date,
+        playlist_count_before=playlist_count_before,
+        target_count=target_count,
+        songs_added=songs_added,
+        playlist_count_after=playlist_count_after,
+        dry_run=dry_run,
+    )
+    
+    # Return success if we're at or above target, or if we added all we could
+    if playlist_count_after >= target_count:
+        return 0
+    elif songs_added:
+        # We added some but couldn't reach target - partial success
+        return 0
+    elif songs_needed > 0:
+        # We needed songs but couldn't add any
         return 1
+    else:
+        return 0
 
 
 # =============================================================================
@@ -1150,15 +1448,22 @@ def show_status(sp, config: Dict[str, Any]) -> None:
     tz = pytz.timezone(config["timezone"])
     today = get_today(tz)
     now = datetime.now(tz)
+    effective_date = get_effective_date(config)
+    target_count = get_target_song_count(config)
+    year_start = get_year_start_date(config)
+    day_number = (effective_date - year_start).days + 1
     
     print(f"\n{'='*60}")
-    print(f"Song of the Day Status — {today} {now.strftime('%H:%M')} {config['timezone']}")
+    print(f"Song of the Day Status — {effective_date} (Day {day_number})")
+    print(f"Current time: {now.strftime('%H:%M')} {config['timezone']}")
     print(f"{'='*60}\n")
     
     # Config info
     print(f"Playlist: {config['playlist_name']}")
     if config.get("playlist_id"):
         print(f"Playlist ID: {config['playlist_id']}")
+    print(f"Year start: {year_start}")
+    print(f"Day boundary: {config.get('day_boundary_hour', 4)}:00 (new day starts at this hour)")
     print(f"Cooldown: {config['cooldown_entries']} entries")
     print(f"Min duration: {config['min_duration_ms'] // 1000}s")
     
@@ -1169,20 +1474,23 @@ def show_status(sp, config: Dict[str, Any]) -> None:
         print(f"⚠️  Playlist '{config['playlist_name']}' not found!")
         print(f"   Create the playlist in Spotify first.")
     else:
-        # Check for additions
-        detection = detect_daily_addition(sp, config, verbose=False)
-        snapshot = detection.get("current_snapshot")
+        # Get current snapshot
+        snapshot = take_playlist_snapshot(sp, config)
         
         if snapshot:
-            print(f"Total tracks: {snapshot['track_count']}")
+            current_count = snapshot['track_count']
+            songs_needed = target_count - current_count
             
-            if detection["added_today"]:
-                print(f"✅ Song added today: Yes ({len(detection['todays_tracks'])} track(s))")
-                for t in detection["todays_tracks"]:
-                    print(f"   → {t['track_name']} — {t['artist']}")
+            print(f"Current tracks: {current_count}")
+            print(f"Target (Day {day_number}): {target_count}")
+            
+            if songs_needed <= 0:
+                if songs_needed == 0:
+                    print(f"✅ Status: Exactly on track!")
+                else:
+                    print(f"✅ Status: {-songs_needed} song(s) ahead of schedule")
             else:
-                print(f"❌ Song added today: No")
-                print(f"   (Will auto-add at finalize time)")
+                print(f"⚠️ Status: {songs_needed} song(s) behind — will add at finalize")
             
             # Show last few tracks in playlist
             if snapshot["tracks"]:
