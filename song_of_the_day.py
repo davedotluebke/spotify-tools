@@ -218,10 +218,14 @@ def send_email(
     config: Dict[str, Any],
     subject: str,
     body: str,
-    html_body: Optional[str] = None
+    html_body: Optional[str] = None,
+    from_name: Optional[str] = None,
 ) -> bool:
     """
     Send an email notification.
+    
+    Args:
+        from_name: Display name for the sender (e.g., "Song of the Day")
     
     Returns True on success, False on failure (logs error but doesn't raise).
     """
@@ -235,9 +239,17 @@ def send_email(
         return False
     
     try:
+        from email.utils import formataddr
+        
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"] = config["email_from"]
+        
+        # Set From with optional display name
+        if from_name:
+            msg["From"] = formataddr((from_name, config["email_from"]))
+        else:
+            msg["From"] = config["email_from"]
+        
         msg["To"] = config["email_to"]
         
         # Plain text version
@@ -288,40 +300,47 @@ def send_nightly_email(
     target_count: int,
     songs_added: List[Dict[str, Any]],
     playlist_count_after: int,
+    recent_tracks: List[Dict[str, Any]],
     dry_run: bool = False,
+    error_message: Optional[str] = None,
 ) -> None:
     """
     Send a nightly summary email after finalize runs.
     
-    Always sends if email is enabled, reporting what happened.
+    Subject format: "🎵 <playlist>: [Auto-]Added <song> by <artist>"
+    Body shows last 5 songs with 🤖/👤 icons.
+    
+    Args:
+        recent_tracks: Last N tracks from the playlist (most recent last)
+        error_message: If set, indicates an error occurred
     """
-    tz = pytz.timezone(config.get("timezone", "America/New_York"))
-    now = datetime.now(tz)
+    playlist_name = config.get('playlist_name', 'Song of the Day')
+    year_start = get_year_start_date(config)
+    day_number = (effective_date - year_start).days + 1
     
-    # Determine status
-    if dry_run:
-        status_emoji = "🔍"
-        status_text = "DRY RUN"
-    elif playlist_count_after >= target_count:
-        status_emoji = "✅"
-        status_text = "On Track"
+    # Determine the most recent song and whether it was auto-added
+    is_error = error_message or (playlist_count_after < target_count and not songs_added)
+    
+    if is_error:
+        # Error case
+        subject = f"🚨 {playlist_name}: Error on Day {day_number}"
     elif songs_added:
-        status_emoji = "🎵"
-        status_text = f"Added {len(songs_added)} song(s)"
+        # Script added song(s) - show the last one added
+        last_added = songs_added[-1]
+        subject = f"🎵 {playlist_name}: Auto-Added {last_added['track_name']} by {last_added['artist']}"
+    elif recent_tracks:
+        # User added song(s) - show the most recent track in playlist
+        last_track = recent_tracks[-1]
+        subject = f"🎵 {playlist_name}: Added {last_track['track_name']} by {last_track['artist']}"
     else:
-        status_emoji = "⚠️"
-        status_text = "Behind Schedule"
+        subject = f"🎵 {playlist_name}: Day {day_number}"
     
-    subject = f"{status_emoji} Song of the Day — {effective_date.strftime('%b %d')} — {status_text}"
-    
-    # Build body
+    # Build plain text body
     lines = [
-        f"Song of the Day — Nightly Report",
-        f"Date: {effective_date.strftime('%A, %B %d, %Y')} (Day {(effective_date - get_year_start_date(config)).days + 1})",
-        f"Run time: {now.strftime('%Y-%m-%d %H:%M %Z')}",
-        f"Playlist: {config.get('playlist_name', 'Unknown')}",
+        f"Song of the Day - Nightly Report",
         f"",
-        f"{'─' * 50}",
+        f"Date: {effective_date.strftime('%A, %B %d, %Y')} (Day {day_number})",
+        f"Playlist: {playlist_name}",
         f"",
     ]
     
@@ -329,89 +348,84 @@ def send_nightly_email(
         lines.append("🔍 DRY RUN — No changes made")
         lines.append("")
     
-    lines.extend([
-        f"Playlist count before: {playlist_count_before}",
-        f"Target count (day {(effective_date - get_year_start_date(config)).days + 1}): {target_count}",
-        f"Songs needed: {max(0, target_count - playlist_count_before)}",
-        f"",
-    ])
+    # Show last 5 songs with icons
+    if recent_tracks:
+        lines.append(f"{'─' * 50}")
+        lines.append("Recent songs:")
+        
+        # Get last 5 tracks
+        display_tracks = recent_tracks[-5:]
+        
+        # Determine which tracks were auto-added (by checking songs_added)
+        auto_added_ids = {s["track_id"] for s in songs_added} if songs_added else set()
+        
+        for track in display_tracks:
+            if track["track_id"] in auto_added_ids:
+                icon = "🤖"  # Auto-added
+            else:
+                icon = "👤"  # User-added
+            lines.append(f"  {icon} {track['track_name']} — {track['artist']}")
+        
+        lines.append(f"{'─' * 50}")
     
-    if songs_added:
-        lines.append(f"{'Added' if not dry_run else 'Would add'} {len(songs_added)} song(s):")
-        for song in songs_added:
-            lines.append(f"  🎵 {song['track_name']} — {song['artist']}")
+    # Only show error info if something went wrong
+    if is_error:
         lines.append("")
-    elif playlist_count_before >= target_count:
-        lines.append("✅ Playlist already at or above target count. No songs added.")
-        lines.append("")
-    else:
-        lines.append("❌ Could not find eligible songs to add!")
-        lines.append("")
-    
-    lines.extend([
-        f"Playlist count after: {playlist_count_after}",
-        f"",
-        f"{'─' * 50}",
-    ])
-    
-    # Add status summary
-    if playlist_count_after >= target_count:
-        diff = playlist_count_after - target_count
-        if diff == 0:
-            lines.append(f"✅ Playlist is exactly on track!")
+        if error_message:
+            lines.append(f"❌ Error: {error_message}")
         else:
-            lines.append(f"✅ Playlist is {diff} song(s) ahead of schedule")
-    else:
-        diff = target_count - playlist_count_after
-        lines.append(f"⚠️ Playlist is {diff} song(s) behind schedule")
+            diff = target_count - playlist_count_after
+            lines.append(f"⚠️ Playlist is {diff} song(s) behind schedule (Day {day_number} = {target_count} songs)")
+            lines.append(f"   Current count: {playlist_count_after}")
     
     body = "\n".join(lines)
     
-    # HTML version
+    # Build HTML body
     html_lines = [
-        "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif;'>",
-        f"<h2>🎵 Song of the Day — Nightly Report</h2>",
-        f"<p><strong>Date:</strong> {effective_date.strftime('%A, %B %d, %Y')} (Day {(effective_date - get_year_start_date(config)).days + 1})</p>",
-        f"<p><strong>Playlist:</strong> {config.get('playlist_name', 'Unknown')}</p>",
-        "<hr>",
+        "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 500px;'>",
+        f"<h2>🎵 Song of the Day - Nightly Report</h2>",
+        f"<p><strong>Date:</strong> {effective_date.strftime('%A, %B %d, %Y')} (Day {day_number})</p>",
+        f"<p><strong>Playlist:</strong> {playlist_name}</p>",
     ]
     
     if dry_run:
         html_lines.append("<p><em>🔍 DRY RUN — No changes made</em></p>")
     
-    html_lines.extend([
-        f"<p>Playlist count before: <strong>{playlist_count_before}</strong></p>",
-        f"<p>Target count: <strong>{target_count}</strong></p>",
-    ])
+    # Show last 5 songs
+    if recent_tracks:
+        html_lines.append("<hr>")
+        html_lines.append("<p><strong>Recent songs:</strong></p>")
+        html_lines.append("<table style='border-collapse: collapse;'>")
+        
+        display_tracks = recent_tracks[-5:]
+        auto_added_ids = {s["track_id"] for s in songs_added} if songs_added else set()
+        
+        for track in display_tracks:
+            if track["track_id"] in auto_added_ids:
+                icon = "🤖"
+            else:
+                icon = "👤"
+            html_lines.append(
+                f"<tr><td style='padding: 4px;'>{icon}</td>"
+                f"<td style='padding: 4px;'><strong>{track['track_name']}</strong> — {track['artist']}</td></tr>"
+            )
+        
+        html_lines.append("</table>")
+        html_lines.append("<hr>")
     
-    if songs_added:
-        html_lines.append(f"<p><strong>{'Added' if not dry_run else 'Would add'} {len(songs_added)} song(s):</strong></p>")
-        html_lines.append("<ul>")
-        for song in songs_added:
-            html_lines.append(f"<li>🎵 <strong>{song['track_name']}</strong> — {song['artist']}</li>")
-        html_lines.append("</ul>")
-    elif playlist_count_before >= target_count:
-        html_lines.append("<p>✅ Playlist already at or above target count. No songs added.</p>")
-    else:
-        html_lines.append("<p>❌ Could not find eligible songs to add!</p>")
-    
-    html_lines.append(f"<p>Playlist count after: <strong>{playlist_count_after}</strong></p>")
-    html_lines.append("<hr>")
-    
-    if playlist_count_after >= target_count:
-        diff = playlist_count_after - target_count
-        if diff == 0:
-            html_lines.append("<p style='color: green;'>✅ Playlist is exactly on track!</p>")
+    # Error info if needed
+    if is_error:
+        if error_message:
+            html_lines.append(f"<p style='color: red;'>❌ Error: {error_message}</p>")
         else:
-            html_lines.append(f"<p style='color: green;'>✅ Playlist is {diff} song(s) ahead of schedule</p>")
-    else:
-        diff = target_count - playlist_count_after
-        html_lines.append(f"<p style='color: orange;'>⚠️ Playlist is {diff} song(s) behind schedule</p>")
+            diff = target_count - playlist_count_after
+            html_lines.append(f"<p style='color: orange;'>⚠️ Playlist is {diff} song(s) behind schedule</p>")
+            html_lines.append(f"<p>Target for Day {day_number}: {target_count} songs<br>Current count: {playlist_count_after}</p>")
     
     html_lines.append("</body></html>")
     html_body = "\n".join(html_lines)
     
-    send_email(config, subject, body, html_body)
+    send_email(config, subject, body, html_body, from_name="Song of the Day")
 
 
 # =============================================================================
@@ -1389,12 +1403,25 @@ def finalize_day(
                     print(f"  ❌ Failed to add track!", file=sys.stderr)
                     break
     
-    # Get final count
-    if songs_added and not dry_run:
+    # Get final snapshot (always, for email recent tracks)
+    if not dry_run:
         final_snapshot = take_playlist_snapshot(sp, config)
-        playlist_count_after = final_snapshot["track_count"] if final_snapshot else playlist_count_before + len(songs_added)
+        if final_snapshot:
+            playlist_count_after = final_snapshot["track_count"]
+            recent_tracks = final_snapshot.get("tracks", [])
+        else:
+            playlist_count_after = playlist_count_before + len(songs_added)
+            recent_tracks = snapshot.get("tracks", [])
     else:
-        playlist_count_after = playlist_count_before + (len(songs_added) if dry_run else 0)
+        playlist_count_after = playlist_count_before + len(songs_added)
+        # For dry run, simulate the added songs in the track list
+        recent_tracks = list(snapshot.get("tracks", []))
+        for song in songs_added:
+            recent_tracks.append({
+                "track_id": song["track_id"],
+                "track_name": song["track_name"],
+                "artist": song["artist"],
+            })
     
     # Summary
     if verbose:
@@ -1423,6 +1450,7 @@ def finalize_day(
         target_count=target_count,
         songs_added=songs_added,
         playlist_count_after=playlist_count_after,
+        recent_tracks=recent_tracks,
         dry_run=dry_run,
     )
     
