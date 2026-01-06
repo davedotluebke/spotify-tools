@@ -91,6 +91,9 @@ DEFAULT_CONFIG = {
     "cooldown_entries": 90,  # Songs can't repeat until 90 others added (0 = no cooldown)
     "min_duration_ms": 50_000,  # 50 seconds minimum
     "selection_mode": "weighted_random",  # "weighted_random" or "most_played"
+    # Prefer songs liked today: if True, songs added to Liked Songs today are
+    # considered first before falling back to listening history
+    "prefer_liked_songs": True,
     # Day boundary: hour at which new day starts (for night owls who stay up past midnight)
     # E.g., 4 means the script considers it "yesterday" until 4am
     "day_boundary_hour": 4,
@@ -1132,6 +1135,74 @@ def select_song_from_candidates(
     return selected
 
 
+def fetch_todays_liked_songs(
+    sp, 
+    config: Dict[str, Any],
+    verbose: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Fetch songs that were added to Liked Songs today.
+    
+    Returns tracks liked on the effective date (respects day_boundary_hour).
+    Since Liked Songs are sorted newest first, we can stop once we hit
+    songs from previous days.
+    """
+    tz = pytz.timezone(config["timezone"])
+    effective_date = get_effective_date(config)
+    
+    tracks = []
+    results = retry_on_timeout(lambda: sp.current_user_saved_tracks(limit=50))
+    
+    while results:
+        found_older = False
+        for item in results.get("items", []):
+            added_at = item.get("added_at", "")
+            if not added_at:
+                continue
+            
+            # Parse the added_at timestamp
+            try:
+                added_dt = datetime.fromisoformat(added_at.replace("Z", "+00:00"))
+                added_local = added_dt.astimezone(tz)
+                added_date = added_local.date()
+            except (ValueError, TypeError):
+                continue
+            
+            # Check if this was liked today (on the effective date)
+            if added_date < effective_date:
+                # Songs are sorted newest first, so we can stop here
+                found_older = True
+                break
+            
+            if added_date == effective_date:
+                track = item.get("track")
+                if not track or not track.get("id"):
+                    continue
+                
+                tracks.append({
+                    "track_id": track["id"],
+                    "track_name": track.get("name", "Unknown"),
+                    "artist": ", ".join(a.get("name", "?") for a in track.get("artists", [])),
+                    "duration_ms": track.get("duration_ms", 0),
+                    "type": track.get("type", "track"),
+                    "added_at": added_at,
+                    "played_at": added_at,  # For compatibility with play_counts lookup
+                })
+        
+        if found_older:
+            break
+        
+        if results.get("next"):
+            results = sp.next(results)
+        else:
+            break
+    
+    if verbose and tracks:
+        print(f"  Found {len(tracks)} song(s) liked today")
+    
+    return tracks
+
+
 def fetch_liked_songs_sample(sp, limit: int = 200) -> List[Dict[str, Any]]:
     """
     Fetch a sample of the user's Liked Songs for fallback selection.
@@ -1173,11 +1244,12 @@ def select_song(
     Select a song to add to the playlist.
     
     Uses fallback cascade:
-    1. Today's listening
+    0. Songs liked today (if prefer_liked_songs is enabled)
+    1. Today's listening history
     2. Last 2 days
     3. Last 3 days
     4. Last week
-    5. Liked Songs
+    5. Liked Songs (random sample)
     
     Args:
         extra_exclude_ids: Additional track IDs to exclude (e.g., tracks already
@@ -1189,6 +1261,7 @@ def select_song(
     cooldown = config.get("cooldown_entries", 90)
     min_duration = config.get("min_duration_ms", 50_000)
     selection_mode = config.get("selection_mode", "weighted_random")
+    prefer_liked = config.get("prefer_liked_songs", True)
     
     cooldown_ids = get_cooldown_track_ids(snapshot, cooldown)
     
@@ -1202,10 +1275,43 @@ def select_song(
         else:
             print(f"  Cooldown: disabled (repeats allowed)")
         print(f"  Selection mode: {selection_mode}")
+        print(f"  Prefer liked songs: {prefer_liked}")
     
-    # Fallback cascade
+    # === Priority 0: Songs liked today ===
+    if prefer_liked:
+        if verbose:
+            print(f"\n  Trying songs liked today...")
+        
+        todays_liked = fetch_todays_liked_songs(sp, config, verbose=False)
+        
+        # Filter to eligible tracks
+        candidates = []
+        for track in todays_liked:
+            eligible, reason = is_eligible(track, cooldown_ids, min_duration)
+            if eligible:
+                candidates.append(track)
+        
+        if verbose:
+            print(f"    Found {len(todays_liked)} liked today, {len(candidates)} eligible")
+        
+        if candidates:
+            # Get play counts from today's listening history for weighted selection
+            log = load_daily_log(today)
+            play_counts = log.get("play_counts", {})
+            
+            selected = select_song_from_candidates(
+                candidates, play_counts, selection_mode=selection_mode
+            )
+            if selected:
+                count = play_counts.get(selected["track_id"], 0)
+                if verbose:
+                    plays_str = f"({count} plays)" if count > 0 else "(not played today)"
+                    print(f"    Selected: {selected['track_name']} — {selected['artist']} {plays_str}")
+                return selected
+    
+    # === Fallback cascade: Listening history ===
     fallback_levels = [
-        ("today", [today]),
+        ("today's listening", [today]),
         ("last 2 days", [today, today - timedelta(days=1)]),
         ("last 3 days", [today - timedelta(days=i) for i in range(3)]),
         ("last week", [today - timedelta(days=i) for i in range(7)]),
@@ -1232,7 +1338,7 @@ def select_song(
                     print(f"    Selected: {selected['track_name']} — {selected['artist']} ({count} plays)")
                 return selected
     
-    # Final fallback: Liked Songs
+    # === Final fallback: Random from Liked Songs ===
     if verbose:
         print(f"\n  Trying Liked Songs fallback...")
     

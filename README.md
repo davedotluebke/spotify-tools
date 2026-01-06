@@ -171,6 +171,7 @@ Configuration is stored at `~/.spotify-tools/config.json`. Created automatically
 | `timezone` | Your timezone for day calculations |
 | `day_boundary_hour` | Hour when a new day starts (default 4 = 4am). For night owls who stay up past midnight. |
 | `year_start_date` | First day of the playlist year (default: Jan 1 of year in playlist name, e.g. `"2026-01-01"`) |
+| `prefer_liked_songs` | If `true` (default), songs liked today are considered first before listening history |
 | `cooldown_entries` | Songs can't repeat until this many others added (0 = no cooldown) |
 | `min_duration_ms` | Minimum track length (filters intros/skits) |
 | `selection_mode` | `"weighted_random"` (default) or `"most_played"` (always top track) |
@@ -305,25 +306,25 @@ By default, a new "day" starts at 4am (`day_boundary_hour`). This handles night 
 
 When songs need to be added:
 
-1. **Build candidate pool** from today's listening history
-2. **Apply eligibility filters**:
+1. **Check songs liked today** (if `prefer_liked_songs` is enabled)
+   - Songs added to your Liked Songs today get priority
+   - If multiple, weighted by play count from today's listening
+2. **Fallback to listening history**:
+   - Today → last 2 days → 3 days → week → random Liked Songs
+3. **Apply eligibility filters**:
    - Not in last N playlist entries (cooldown, default 90)
    - Not a podcast episode
    - At least 50 seconds long
-3. **Rank by play count** (most-played first)
 4. **Select** based on `selection_mode`:
    - `weighted_random`: Random from top 5, weighted by play count
    - `most_played`: Always picks the top track
-5. **Fallback cascade** if no eligible songs:
-   - Try last 2 days → 3 days → week → Liked Songs
 
 ### Nightly Email
 
-After each finalize run, an email is sent (if configured) reporting:
-- Playlist count before/after
-- Target count for the day
-- Songs added (or why none were added)
-- Whether playlist is on track, ahead, or behind
+After each finalize run, an email is sent (if configured) showing:
+- The song added (and whether it was auto-added or user-added)
+- The last 5 songs in the playlist with 🤖/👤 icons
+- Error details only if something went wrong
 
 ### Why Minute-by-Minute Polling?
 
