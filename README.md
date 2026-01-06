@@ -174,7 +174,7 @@ Configuration is stored at `~/.spotify-tools/config.json`. Created automatically
 | `prefer_liked_songs` | If `true` (default), songs liked today are considered first before listening history |
 | `cooldown_entries` | Songs can't repeat until this many others added (0 = no cooldown) |
 | `min_duration_ms` | Minimum track length (filters intros/skits) |
-| `selection_mode` | `"weighted_random"` (default) or `"most_played"` (always top track) |
+| `selection_mode` | `"weighted_random"` (prefers songs played more often), `"strongly_weighted_random"` (default, strongly prefers frequently played songs), or `"most_played"` (always choose most-played track) |
 | `email_enabled` | Set `true` to enable email notifications |
 | `email_to` | Recipient email address |
 | `smtp_*` | SMTP server settings (see Email Setup below) |
@@ -317,6 +317,7 @@ When songs need to be added:
    - At least 50 seconds long
 4. **Select** based on `selection_mode`:
    - `weighted_random`: Random from top 5, weighted by play count
+   - `strongly_weighted_random`: Like weighted_random but squares play counts (4 plays = 16x weight vs 1 play)
    - `most_played`: Always picks the top track
 
 ### Nightly Email

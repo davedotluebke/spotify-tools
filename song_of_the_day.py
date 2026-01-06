@@ -90,7 +90,7 @@ DEFAULT_CONFIG = {
     "timezone": "America/New_York",
     "cooldown_entries": 90,  # Songs can't repeat until 90 others added (0 = no cooldown)
     "min_duration_ms": 50_000,  # 50 seconds minimum
-    "selection_mode": "weighted_random",  # "weighted_random" or "most_played"
+    "selection_mode": "strongly_weighted_random",  # "strongly_weighted_random", "weighted_random", or "most_played"
     # Prefer songs liked today: if True, songs added to Liked Songs today are
     # considered first before falling back to listening history
     "prefer_liked_songs": True,
@@ -1100,10 +1100,12 @@ def select_song_from_candidates(
     
     Modes:
         - "weighted_random": Top N by play count, weighted random selection
+        - "strongly_weighted_random": Like weighted_random but squares play counts,
+          heavily favoring songs with more plays
         - "most_played": Always pick the single most-played track
     
     1. Rank by play count (descending), then by most recent play
-    2. For weighted_random: take top N, select randomly weighted by play count
+    2. For weighted modes: take top N, select randomly weighted by play count
     3. For most_played: just return the top one
     """
     if not candidates:
@@ -1121,15 +1123,20 @@ def select_song_from_candidates(
     if selection_mode == "most_played":
         return ranked[0]
     
-    # For "weighted_random" mode (default)
+    # For weighted random modes
     # Take top N
     top_candidates = ranked[:top_n]
     
     if len(top_candidates) == 1:
         return top_candidates[0]
     
-    # Weighted random selection
+    # Calculate weights based on mode
     weights = [play_counts.get(t["track_id"], 1) for t in top_candidates]
+    
+    # For strongly_weighted_random, square the weights to heavily favor more-played songs
+    if selection_mode == "strongly_weighted_random":
+        weights = [w ** 2 for w in weights]
+    
     selected = random.choices(top_candidates, weights=weights, k=1)[0]
     
     return selected
