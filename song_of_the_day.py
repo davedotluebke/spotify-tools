@@ -306,37 +306,55 @@ def send_nightly_email(
     recent_tracks: List[Dict[str, Any]],
     dry_run: bool = False,
     error_message: Optional[str] = None,
+    profile_name: Optional[str] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    play_counts: Optional[Dict[str, int]] = None,
+    all_listened_songs: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
     Send a nightly summary email after finalize runs.
     
-    Subject format: "🎵 <playlist>: [Auto-]Added <song> by <artist>"
-    Body shows last 5 songs with 🤖/👤 icons.
+    Subject format: "SotD [<profile>]: Added <song> by <artist>"
+    Body shows last 5 songs with 🤖/👤 icons, candidates considered, and all listened songs.
     
     Args:
         recent_tracks: Last N tracks from the playlist (most recent last)
         error_message: If set, indicates an error occurred
+        profile_name: Profile name (omit from subject if "default")
+        candidates: List of candidate songs considered for selection
+        play_counts: Dict of track_id -> play count
+        all_listened_songs: All songs listened to that day
     """
     playlist_name = config.get('playlist_name', 'Song of the Day')
     year_start = get_year_start_date(config)
     day_number = (effective_date - year_start).days + 1
+    
+    # Format profile prefix for subject
+    if profile_name and profile_name != "default":
+        profile_prefix = f"SotD [{profile_name}]:"
+    else:
+        profile_prefix = "SotD:"
     
     # Determine the most recent song and whether it was auto-added
     is_error = error_message or (playlist_count_after < target_count and not songs_added)
     
     if is_error:
         # Error case
-        subject = f"🚨 {playlist_name}: Error on Day {day_number}"
+        subject = f"🚨 {profile_prefix} Error on Day {day_number}"
     elif songs_added:
         # Script added song(s) - show the last one added
         last_added = songs_added[-1]
-        subject = f"🎵 {playlist_name}: Auto-Added {last_added['track_name']} by {last_added['artist']}"
+        subject = f"🎵 {profile_prefix} Added {last_added['track_name']} by {last_added['artist']}"
     elif recent_tracks:
         # User added song(s) - show the most recent track in playlist
         last_track = recent_tracks[-1]
-        subject = f"🎵 {playlist_name}: Added {last_track['track_name']} by {last_track['artist']}"
+        subject = f"🎵 {profile_prefix} Added {last_track['track_name']} by {last_track['artist']}"
     else:
-        subject = f"🎵 {playlist_name}: Day {day_number}"
+        subject = f"🎵 {profile_prefix} Day {day_number}"
+    
+    # Initialize play_counts if not provided
+    if play_counts is None:
+        play_counts = {}
     
     # Build plain text body
     lines = [
@@ -371,6 +389,38 @@ def send_nightly_email(
         
         lines.append(f"{'─' * 50}")
     
+    # Show candidates considered (if any)
+    if candidates:
+        lines.append("")
+        lines.append(f"{'─' * 50}")
+        lines.append(f"Candidates considered ({len(candidates)}):")
+        for track in candidates[:10]:  # Limit to top 10
+            count = play_counts.get(track["track_id"], 0)
+            plays_str = f"({count} play{'s' if count != 1 else ''})" if count > 0 else "(liked today)"
+            lines.append(f"  • {track['track_name']} — {track['artist']} {plays_str}")
+        if len(candidates) > 10:
+            lines.append(f"  ... and {len(candidates) - 10} more")
+        lines.append(f"{'─' * 50}")
+    
+    # Show all listened songs (excluding candidates to avoid duplication)
+    if all_listened_songs:
+        candidate_ids = {c["track_id"] for c in (candidates or [])}
+        other_songs = [s for s in all_listened_songs if s["track_id"] not in candidate_ids]
+        
+        if other_songs:
+            lines.append("")
+            lines.append(f"{'─' * 50}")
+            lines.append(f"Other songs listened to today ({len(other_songs)}):")
+            # Sort by play count descending
+            sorted_songs = sorted(other_songs, key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
+            for track in sorted_songs[:15]:  # Limit to top 15
+                count = play_counts.get(track["track_id"], 0)
+                plays_str = f"({count} play{'s' if count != 1 else ''})"
+                lines.append(f"  • {track['track_name']} — {track['artist']} {plays_str}")
+            if len(sorted_songs) > 15:
+                lines.append(f"  ... and {len(sorted_songs) - 15} more")
+            lines.append(f"{'─' * 50}")
+    
     # Only show error info if something went wrong
     if is_error:
         lines.append("")
@@ -385,7 +435,7 @@ def send_nightly_email(
     
     # Build HTML body
     html_lines = [
-        "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 500px;'>",
+        "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px;'>",
         f"<h2>🎵 Song of the Day - Nightly Report</h2>",
         f"<p><strong>Date:</strong> {effective_date.strftime('%A, %B %d, %Y')} (Day {day_number})</p>",
         f"<p><strong>Playlist:</strong> {playlist_name}</p>",
@@ -415,6 +465,45 @@ def send_nightly_email(
         
         html_lines.append("</table>")
         html_lines.append("<hr>")
+    
+    # Show candidates in HTML
+    if candidates:
+        html_lines.append(f"<p><strong>Candidates considered ({len(candidates)}):</strong></p>")
+        html_lines.append("<table style='border-collapse: collapse;'>")
+        for track in candidates[:10]:
+            count = play_counts.get(track["track_id"], 0)
+            plays_str = f"({count} play{'s' if count != 1 else ''})" if count > 0 else "(liked today)"
+            html_lines.append(
+                f"<tr><td style='padding: 4px;'>•</td>"
+                f"<td style='padding: 4px;'>{track['track_name']} — {track['artist']} "
+                f"<span style='color: #666;'>{plays_str}</span></td></tr>"
+            )
+        if len(candidates) > 10:
+            html_lines.append(f"<tr><td></td><td style='padding: 4px; color: #666;'>... and {len(candidates) - 10} more</td></tr>")
+        html_lines.append("</table>")
+        html_lines.append("<hr>")
+    
+    # Show other listened songs in HTML
+    if all_listened_songs:
+        candidate_ids = {c["track_id"] for c in (candidates or [])}
+        other_songs = [s for s in all_listened_songs if s["track_id"] not in candidate_ids]
+        
+        if other_songs:
+            html_lines.append(f"<p><strong>Other songs listened to today ({len(other_songs)}):</strong></p>")
+            html_lines.append("<table style='border-collapse: collapse;'>")
+            sorted_songs = sorted(other_songs, key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
+            for track in sorted_songs[:15]:
+                count = play_counts.get(track["track_id"], 0)
+                plays_str = f"({count} play{'s' if count != 1 else ''})"
+                html_lines.append(
+                    f"<tr><td style='padding: 4px;'>•</td>"
+                    f"<td style='padding: 4px;'>{track['track_name']} — {track['artist']} "
+                    f"<span style='color: #666;'>{plays_str}</span></td></tr>"
+                )
+            if len(sorted_songs) > 15:
+                html_lines.append(f"<tr><td></td><td style='padding: 4px; color: #666;'>... and {len(sorted_songs) - 15} more</td></tr>")
+            html_lines.append("</table>")
+            html_lines.append("<hr>")
     
     # Error info if needed
     if is_error:
@@ -1262,6 +1351,35 @@ def select_song(
         extra_exclude_ids: Additional track IDs to exclude (e.g., tracks already
                           added in this run when adding multiple songs)
     """
+    selected, _ = select_song_with_candidates(sp, config, snapshot, verbose, extra_exclude_ids)
+    return selected
+
+
+def select_song_with_candidates(
+    sp,
+    config: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    verbose: bool = True,
+    extra_exclude_ids: Optional[set] = None,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Select a song to add to the playlist, returning both the selection and candidates.
+    
+    Uses fallback cascade:
+    0. Songs liked today (if prefer_liked_songs is enabled)
+    1. Today's listening history
+    2. Last 2 days
+    3. Last 3 days
+    4. Last week
+    5. Liked Songs (random sample)
+    
+    Args:
+        extra_exclude_ids: Additional track IDs to exclude (e.g., tracks already
+                          added in this run when adding multiple songs)
+    
+    Returns:
+        Tuple of (selected_track, candidates_list)
+    """
     tz = pytz.timezone(config["timezone"])
     today = get_today(tz)
     
@@ -1314,7 +1432,7 @@ def select_song(
                 if verbose:
                     plays_str = f"({count} plays)" if count > 0 else "(not played today)"
                     print(f"    Selected: {selected['track_name']} — {selected['artist']} {plays_str}")
-                return selected
+                return selected, candidates
     
     # === Fallback cascade: Listening history ===
     fallback_levels = [
@@ -1343,7 +1461,7 @@ def select_song(
                 count = play_counts.get(selected["track_id"], 1)
                 if verbose:
                     print(f"    Selected: {selected['track_name']} — {selected['artist']} ({count} plays)")
-                return selected
+                return selected, candidates
     
     # === Final fallback: Random from Liked Songs ===
     if verbose:
@@ -1364,12 +1482,12 @@ def select_song(
         selected = random.choice(candidates)
         if verbose:
             print(f"    Selected: {selected['track_name']} — {selected['artist']}")
-        return selected
+        return selected, candidates
     
     if verbose:
         print(f"  ❌ No eligible songs found anywhere!")
     
-    return None
+    return None, []
 
 
 # =============================================================================
@@ -1414,10 +1532,12 @@ def finalize_day(
     """
     tz = pytz.timezone(config["timezone"])
     now = datetime.now(tz)
+    today = get_today(tz)
     effective_date = get_effective_date(config)
     target_count = get_target_song_count(config)
     year_start = get_year_start_date(config)
     day_number = (effective_date - year_start).days + 1
+    profile_name = get_profile()
     
     if verbose:
         print(f"Finalizing for {effective_date} (Day {day_number}) at {now.strftime('%H:%M')} {config['timezone']}")
@@ -1442,6 +1562,33 @@ def finalize_day(
         print(f"❌ Could not fetch playlist!", file=sys.stderr)
         return 1
     
+    # Record any user-added songs (tracks added today that aren't in additions log)
+    existing_additions = load_additions_log()
+    existing_today_ids = {
+        e["track_id"] for e in existing_additions 
+        if e.get("date") == effective_date.isoformat()
+    }
+    
+    for track in snapshot.get("tracks", []):
+        added_at = track.get("added_at", "")
+        if added_at:
+            try:
+                added_dt = datetime.fromisoformat(added_at.replace("Z", "+00:00"))
+                added_local = added_dt.astimezone(tz)
+                if added_local.date() == effective_date and track["track_id"] not in existing_today_ids:
+                    # This track was added today but not recorded - it's a user addition
+                    record_addition(
+                        track_id=track["track_id"],
+                        track_name=track["track_name"],
+                        artist=track["artist"],
+                        source="user",
+                        date_added=effective_date,
+                    )
+                    if verbose:
+                        print(f"  📝 Recorded user addition: {track['track_name']} — {track['artist']}")
+            except (ValueError, TypeError):
+                pass
+    
     playlist_count_before = snapshot["track_count"]
     songs_needed = target_count - playlist_count_before
     
@@ -1450,8 +1597,21 @@ def finalize_day(
         print(f"Target count (Day {day_number}): {target_count}")
         print(f"Songs needed: {max(0, songs_needed)}")
     
-    # Track what we add
+    # Load today's listening history for email info
+    daily_log = load_daily_log(today)
+    play_counts = daily_log.get("play_counts", {})
+    
+    # Build list of all unique listened songs for email
+    seen_tracks: Dict[str, Dict[str, Any]] = {}
+    for play in daily_log.get("plays", []):
+        track_id = play["track_id"]
+        if track_id not in seen_tracks:
+            seen_tracks[track_id] = play
+    all_listened_songs = list(seen_tracks.values())
+    
+    # Track what we add and candidates considered
     songs_added: List[Dict[str, Any]] = []
+    all_candidates: List[Dict[str, Any]] = []
     extra_exclude_ids: set = set()
     
     if songs_needed <= 0:
@@ -1474,11 +1634,18 @@ def finalize_day(
             if songs_added and not dry_run:
                 snapshot = take_playlist_snapshot(sp, config)
             
-            selected = select_song(
+            selected, candidates = select_song_with_candidates(
                 sp, config, snapshot, 
                 verbose=verbose, 
                 extra_exclude_ids=extra_exclude_ids
             )
+            
+            # Collect candidates (avoid duplicates)
+            existing_candidate_ids = {c["track_id"] for c in all_candidates}
+            for c in candidates:
+                if c["track_id"] not in existing_candidate_ids:
+                    all_candidates.append(c)
+                    existing_candidate_ids.add(c["track_id"])
             
             if not selected:
                 print(f"\n⚠️ Could not find eligible song #{i + 1}. Stopping.", file=sys.stderr)
@@ -1565,6 +1732,10 @@ def finalize_day(
         playlist_count_after=playlist_count_after,
         recent_tracks=recent_tracks,
         dry_run=dry_run,
+        profile_name=profile_name,
+        candidates=all_candidates,
+        play_counts=play_counts,
+        all_listened_songs=all_listened_songs,
     )
     
     # Return success if we're at or above target, or if we added all we could
@@ -1668,14 +1839,22 @@ def show_status(sp, config: Dict[str, Any]) -> None:
 # Weekly Summary
 # =============================================================================
 
-def generate_weekly_summary(config: Dict[str, Any], verbose: bool = True) -> Tuple[str, str]:
+def generate_weekly_summary(
+    config: Dict[str, Any], 
+    verbose: bool = True,
+    profile_name: Optional[str] = None,
+) -> Tuple[str, str]:
     """
     Generate a weekly summary of songs added.
+    
+    Args:
+        profile_name: Profile name for display (omit from header if "default")
     
     Returns (plain_text, html) versions of the summary.
     """
     tz = pytz.timezone(config["timezone"])
     today = get_today(tz)
+    playlist_name = config.get('playlist_name', 'Song of the Day')
     
     # Get the last 7 days (including today)
     start_date = today - timedelta(days=6)
@@ -1698,6 +1877,8 @@ def generate_weekly_summary(config: Dict[str, Any], verbose: bool = True) -> Tup
     # Build plain text
     lines = [
         f"🎵 Song of the Day — Weekly Summary",
+        f"",
+        f"Playlist: {playlist_name}",
         f"Week of {start_date.strftime('%b %d')} – {end_date.strftime('%b %d, %Y')}",
         f"",
         f"Total songs: {len(additions)} ({user_count} manual, {auto_count} auto-picked)",
@@ -1728,8 +1909,9 @@ def generate_weekly_summary(config: Dict[str, Any], verbose: bool = True) -> Tup
     
     # Build HTML version
     html_lines = [
-        "<html><body>",
+        "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px;'>",
         "<h2>🎵 Song of the Day — Weekly Summary</h2>",
+        f"<p><strong>Playlist:</strong> {playlist_name}</p>",
         f"<p><strong>Week of {start_date.strftime('%b %d')} – {end_date.strftime('%b %d, %Y')}</strong></p>",
         f"<p>Total songs: {len(additions)} ({user_count} manual, {auto_count} auto-picked)</p>",
         "<hr>",
@@ -1777,11 +1959,13 @@ def send_weekly_summary(config: Dict[str, Any], verbose: bool = True) -> int:
     """
     tz = pytz.timezone(config["timezone"])
     today = get_today(tz)
+    profile_name = get_profile()
+    playlist_name = config.get('playlist_name', 'Song of the Day')
     
     if verbose:
         print("Generating weekly summary...")
     
-    plain_text, html_text = generate_weekly_summary(config, verbose=verbose)
+    plain_text, html_text = generate_weekly_summary(config, verbose=verbose, profile_name=profile_name)
     
     if verbose:
         print("\n" + plain_text + "\n")
@@ -1791,12 +1975,18 @@ def send_weekly_summary(config: Dict[str, Any], verbose: bool = True) -> int:
             print("Email not enabled. To send this summary, configure email settings in config.json")
         return 0
     
-    subject = f"🎵 Song of the Day — Weekly Summary ({today.strftime('%b %d')})"
+    # Format profile prefix for subject
+    if profile_name and profile_name != "default":
+        profile_prefix = f"SotD [{profile_name}]:"
+    else:
+        profile_prefix = "SotD:"
+    
+    subject = f"🎵 {profile_prefix} Weekly Summary {playlist_name}"
     
     if verbose:
         print(f"Sending email to {config.get('email_to')}...")
     
-    success = send_email(config, subject, plain_text, html_text)
+    success = send_email(config, subject, plain_text, html_text, from_name="Song of the Day")
     
     if success:
         if verbose:
