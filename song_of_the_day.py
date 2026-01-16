@@ -398,7 +398,7 @@ def send_nightly_email(
     
     # Show candidates considered - separated by category
     total_candidates = len(liked_today_candidates) + len(listened_candidates)
-    if total_candidates > 0:
+    if total_candidates > 0 or all_listened_songs:
         lines.append("")
         lines.append(f"{'─' * 50}")
         lines.append(f"Candidates considered ({total_candidates}):")
@@ -411,20 +411,25 @@ def send_nightly_email(
                                   key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
             for track in sorted_liked:
                 count = play_counts.get(track["track_id"], 0)
-                plays_str = f" — {count} play{'s' if count != 1 else ''}" if count > 0 else ""
-                lines.append(f"    • {track['track_name']} — {track['artist']}{plays_str}")
+                lines.append(f"    • {track['track_name']} — {track['artist']} ({count})")
         
         # Show listened candidates
+        lines.append(f"\n  🎧 Listened today ({len(listened_candidates)}):")
         if listened_candidates:
-            lines.append(f"\n  🎧 Listened today ({len(listened_candidates)}):")
             # Sort by play count descending
             sorted_listened = sorted(listened_candidates, 
                                      key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
             for track in sorted_listened[:20]:  # Limit to top 20
                 count = play_counts.get(track["track_id"], 0)
-                lines.append(f"    • {track['track_name']} — {track['artist']} — {count} play{'s' if count != 1 else ''}")
+                lines.append(f"    • {track['track_name']} — {track['artist']} ({count})")
             if len(sorted_listened) > 20:
                 lines.append(f"    ... and {len(sorted_listened) - 20} more")
+        else:
+            # Explain why there are no listened candidates
+            if all_listened_songs:
+                lines.append(f"    (none — all filtered by cooldown)")
+            else:
+                lines.append(f"    (none)")
         
         lines.append(f"{'─' * 50}")
     
@@ -492,7 +497,7 @@ def send_nightly_email(
         html_lines.append("<hr>")
     
     # Show candidates in HTML - two-column table format
-    if total_candidates > 0:
+    if total_candidates > 0 or all_listened_songs:
         html_lines.append(f"<p><strong>Candidates considered ({total_candidates}):</strong></p>")
         html_lines.append("<table style='border-collapse: collapse; width: 100%;'>")
         
@@ -507,8 +512,7 @@ def send_nightly_email(
                                   key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
             for track in sorted_liked:
                 count = play_counts.get(track["track_id"], 0)
-                plays_str = f" <span style='color:#666;'>({count})</span>" if count > 0 else ""
-                html_lines.append(f"• {track['track_name']} — {track['artist']}{plays_str}<br>")
+                html_lines.append(f"• {track['track_name']} — {track['artist']} <span style='color:#666;'>({count})</span><br>")
         else:
             html_lines.append("<span style='color:#999;'>(none)</span>")
         html_lines.append("</td>")
@@ -525,7 +529,11 @@ def send_nightly_email(
             if len(sorted_listened) > 20:
                 html_lines.append(f"<span style='color:#666;'>... and {len(sorted_listened) - 20} more</span>")
         else:
-            html_lines.append("<span style='color:#999;'>(none)</span>")
+            # Explain why there are no listened candidates
+            if all_listened_songs:
+                html_lines.append("<span style='color:#999;'>(none — all filtered by cooldown)</span>")
+            else:
+                html_lines.append("<span style='color:#999;'>(none)</span>")
         html_lines.append("</td>")
         
         html_lines.append("</tr></table>")
