@@ -307,7 +307,8 @@ def send_nightly_email(
     dry_run: bool = False,
     error_message: Optional[str] = None,
     profile_name: Optional[str] = None,
-    candidates: Optional[List[Dict[str, Any]]] = None,
+    liked_today_candidates: Optional[List[Dict[str, Any]]] = None,
+    listened_candidates: Optional[List[Dict[str, Any]]] = None,
     play_counts: Optional[Dict[str, int]] = None,
     all_listened_songs: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
@@ -321,7 +322,8 @@ def send_nightly_email(
         recent_tracks: Last N tracks from the playlist (most recent last)
         error_message: If set, indicates an error occurred
         profile_name: Profile name (omit from subject if "default")
-        candidates: List of candidate songs considered for selection
+        liked_today_candidates: Songs liked today that were eligible candidates
+        listened_candidates: Songs from listening history that were eligible candidates
         play_counts: Dict of track_id -> play count
         all_listened_songs: All songs listened to that day
     """
@@ -352,9 +354,17 @@ def send_nightly_email(
     else:
         subject = f"🎵 {profile_prefix} Day {day_number}"
     
-    # Initialize play_counts if not provided
+    # Initialize defaults
     if play_counts is None:
         play_counts = {}
+    if liked_today_candidates is None:
+        liked_today_candidates = []
+    if listened_candidates is None:
+        listened_candidates = []
+    
+    # Load additions log to determine auto vs user-added for recent songs
+    additions_log = load_additions_log()
+    auto_added_ids = {a["track_id"] for a in additions_log if a.get("source") == "auto"}
     
     # Build plain text body
     lines = [
@@ -377,9 +387,6 @@ def send_nightly_email(
         # Get last 5 tracks
         display_tracks = recent_tracks[-5:]
         
-        # Determine which tracks were auto-added (by checking songs_added)
-        auto_added_ids = {s["track_id"] for s in songs_added} if songs_added else set()
-        
         for track in display_tracks:
             if track["track_id"] in auto_added_ids:
                 icon = "🤖"  # Auto-added
@@ -389,22 +396,42 @@ def send_nightly_email(
         
         lines.append(f"{'─' * 50}")
     
-    # Show candidates considered (if any)
-    if candidates:
+    # Show candidates considered - separated by category
+    total_candidates = len(liked_today_candidates) + len(listened_candidates)
+    if total_candidates > 0:
         lines.append("")
         lines.append(f"{'─' * 50}")
-        lines.append(f"Candidates considered ({len(candidates)}):")
-        for track in candidates[:10]:  # Limit to top 10
-            count = play_counts.get(track["track_id"], 0)
-            plays_str = f"({count} play{'s' if count != 1 else ''})" if count > 0 else "(liked today)"
-            lines.append(f"  • {track['track_name']} — {track['artist']} {plays_str}")
-        if len(candidates) > 10:
-            lines.append(f"  ... and {len(candidates) - 10} more")
+        lines.append(f"Candidates considered ({total_candidates}):")
+        
+        # Show liked today first
+        if liked_today_candidates:
+            lines.append(f"\n  ❤️ Liked today ({len(liked_today_candidates)}):")
+            # Sort by play count descending
+            sorted_liked = sorted(liked_today_candidates, 
+                                  key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
+            for track in sorted_liked:
+                count = play_counts.get(track["track_id"], 0)
+                plays_str = f" — {count} play{'s' if count != 1 else ''}" if count > 0 else ""
+                lines.append(f"    • {track['track_name']} — {track['artist']}{plays_str}")
+        
+        # Show listened candidates
+        if listened_candidates:
+            lines.append(f"\n  🎧 Listened today ({len(listened_candidates)}):")
+            # Sort by play count descending
+            sorted_listened = sorted(listened_candidates, 
+                                     key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
+            for track in sorted_listened[:20]:  # Limit to top 20
+                count = play_counts.get(track["track_id"], 0)
+                lines.append(f"    • {track['track_name']} — {track['artist']} — {count} play{'s' if count != 1 else ''}")
+            if len(sorted_listened) > 20:
+                lines.append(f"    ... and {len(sorted_listened) - 20} more")
+        
         lines.append(f"{'─' * 50}")
     
     # Show all listened songs (excluding candidates to avoid duplication)
     if all_listened_songs:
-        candidate_ids = {c["track_id"] for c in (candidates or [])}
+        candidate_ids = {c["track_id"] for c in liked_today_candidates}
+        candidate_ids.update(c["track_id"] for c in listened_candidates)
         other_songs = [s for s in all_listened_songs if s["track_id"] not in candidate_ids]
         
         if other_songs:
@@ -415,8 +442,7 @@ def send_nightly_email(
             sorted_songs = sorted(other_songs, key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
             for track in sorted_songs[:15]:  # Limit to top 15
                 count = play_counts.get(track["track_id"], 0)
-                plays_str = f"({count} play{'s' if count != 1 else ''})"
-                lines.append(f"  • {track['track_name']} — {track['artist']} {plays_str}")
+                lines.append(f"  • {track['track_name']} — {track['artist']} — {count} play{'s' if count != 1 else ''}")
             if len(sorted_songs) > 15:
                 lines.append(f"  ... and {len(sorted_songs) - 15} more")
             lines.append(f"{'─' * 50}")
@@ -451,7 +477,6 @@ def send_nightly_email(
         html_lines.append("<table style='border-collapse: collapse;'>")
         
         display_tracks = recent_tracks[-5:]
-        auto_added_ids = {s["track_id"] for s in songs_added} if songs_added else set()
         
         for track in display_tracks:
             if track["track_id"] in auto_added_ids:
@@ -466,26 +491,50 @@ def send_nightly_email(
         html_lines.append("</table>")
         html_lines.append("<hr>")
     
-    # Show candidates in HTML
-    if candidates:
-        html_lines.append(f"<p><strong>Candidates considered ({len(candidates)}):</strong></p>")
-        html_lines.append("<table style='border-collapse: collapse;'>")
-        for track in candidates[:10]:
-            count = play_counts.get(track["track_id"], 0)
-            plays_str = f"({count} play{'s' if count != 1 else ''})" if count > 0 else "(liked today)"
-            html_lines.append(
-                f"<tr><td style='padding: 4px;'>•</td>"
-                f"<td style='padding: 4px;'>{track['track_name']} — {track['artist']} "
-                f"<span style='color: #666;'>{plays_str}</span></td></tr>"
-            )
-        if len(candidates) > 10:
-            html_lines.append(f"<tr><td></td><td style='padding: 4px; color: #666;'>... and {len(candidates) - 10} more</td></tr>")
-        html_lines.append("</table>")
+    # Show candidates in HTML - two-column table format
+    if total_candidates > 0:
+        html_lines.append(f"<p><strong>Candidates considered ({total_candidates}):</strong></p>")
+        html_lines.append("<table style='border-collapse: collapse; width: 100%;'>")
+        
+        # Create two columns: liked today | listened today
+        html_lines.append("<tr style='vertical-align: top;'>")
+        
+        # Left column: Liked today
+        html_lines.append("<td style='padding: 8px; width: 50%; border-right: 1px solid #ddd;'>")
+        html_lines.append(f"<strong>❤️ Liked today ({len(liked_today_candidates)})</strong><br>")
+        if liked_today_candidates:
+            sorted_liked = sorted(liked_today_candidates, 
+                                  key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
+            for track in sorted_liked:
+                count = play_counts.get(track["track_id"], 0)
+                plays_str = f" <span style='color:#666;'>({count})</span>" if count > 0 else ""
+                html_lines.append(f"• {track['track_name']} — {track['artist']}{plays_str}<br>")
+        else:
+            html_lines.append("<span style='color:#999;'>(none)</span>")
+        html_lines.append("</td>")
+        
+        # Right column: Listened today
+        html_lines.append("<td style='padding: 8px; width: 50%;'>")
+        html_lines.append(f"<strong>🎧 Listened today ({len(listened_candidates)})</strong><br>")
+        if listened_candidates:
+            sorted_listened = sorted(listened_candidates, 
+                                     key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
+            for track in sorted_listened[:20]:
+                count = play_counts.get(track["track_id"], 0)
+                html_lines.append(f"• {track['track_name']} — {track['artist']} <span style='color:#666;'>({count})</span><br>")
+            if len(sorted_listened) > 20:
+                html_lines.append(f"<span style='color:#666;'>... and {len(sorted_listened) - 20} more</span>")
+        else:
+            html_lines.append("<span style='color:#999;'>(none)</span>")
+        html_lines.append("</td>")
+        
+        html_lines.append("</tr></table>")
         html_lines.append("<hr>")
     
     # Show other listened songs in HTML
     if all_listened_songs:
-        candidate_ids = {c["track_id"] for c in (candidates or [])}
+        candidate_ids = {c["track_id"] for c in liked_today_candidates}
+        candidate_ids.update(c["track_id"] for c in listened_candidates)
         other_songs = [s for s in all_listened_songs if s["track_id"] not in candidate_ids]
         
         if other_songs:
@@ -494,14 +543,13 @@ def send_nightly_email(
             sorted_songs = sorted(other_songs, key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
             for track in sorted_songs[:15]:
                 count = play_counts.get(track["track_id"], 0)
-                plays_str = f"({count} play{'s' if count != 1 else ''})"
                 html_lines.append(
-                    f"<tr><td style='padding: 4px;'>•</td>"
-                    f"<td style='padding: 4px;'>{track['track_name']} — {track['artist']} "
-                    f"<span style='color: #666;'>{plays_str}</span></td></tr>"
+                    f"<tr><td style='padding: 2px;'>•</td>"
+                    f"<td style='padding: 2px;'>{track['track_name']} — {track['artist']} "
+                    f"<span style='color: #666;'>({count})</span></td></tr>"
                 )
             if len(sorted_songs) > 15:
-                html_lines.append(f"<tr><td></td><td style='padding: 4px; color: #666;'>... and {len(sorted_songs) - 15} more</td></tr>")
+                html_lines.append(f"<tr><td></td><td style='padding: 2px; color: #666;'>... and {len(sorted_songs) - 15} more</td></tr>")
             html_lines.append("</table>")
             html_lines.append("<hr>")
     
@@ -1351,7 +1399,7 @@ def select_song(
         extra_exclude_ids: Additional track IDs to exclude (e.g., tracks already
                           added in this run when adding multiple songs)
     """
-    selected, _ = select_song_with_candidates(sp, config, snapshot, verbose, extra_exclude_ids)
+    selected, _, _ = select_song_with_candidates(sp, config, snapshot, verbose, extra_exclude_ids)
     return selected
 
 
@@ -1361,7 +1409,7 @@ def select_song_with_candidates(
     snapshot: Dict[str, Any],
     verbose: bool = True,
     extra_exclude_ids: Optional[set] = None,
-) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Select a song to add to the playlist, returning both the selection and candidates.
     
@@ -1378,7 +1426,7 @@ def select_song_with_candidates(
                           added in this run when adding multiple songs)
     
     Returns:
-        Tuple of (selected_track, candidates_list)
+        Tuple of (selected_track, liked_today_candidates, listened_candidates)
     """
     tz = pytz.timezone(config["timezone"])
     today = get_today(tz)
@@ -1402,6 +1450,10 @@ def select_song_with_candidates(
         print(f"  Selection mode: {selection_mode}")
         print(f"  Prefer liked songs: {prefer_liked}")
     
+    # Track candidates from each source
+    liked_today_candidates: List[Dict[str, Any]] = []
+    listened_candidates: List[Dict[str, Any]] = []
+    
     # === Priority 0: Songs liked today ===
     if prefer_liked:
         if verbose:
@@ -1410,39 +1462,40 @@ def select_song_with_candidates(
         todays_liked = fetch_todays_liked_songs(sp, config, verbose=False)
         
         # Filter to eligible tracks
-        candidates = []
         for track in todays_liked:
             eligible, reason = is_eligible(track, cooldown_ids, min_duration)
             if eligible:
-                candidates.append(track)
+                liked_today_candidates.append(track)
         
         if verbose:
-            print(f"    Found {len(todays_liked)} liked today, {len(candidates)} eligible")
+            print(f"    Found {len(todays_liked)} liked today, {len(liked_today_candidates)} eligible")
         
-        if candidates:
+        if liked_today_candidates:
             # Get play counts from today's listening history for weighted selection
             log = load_daily_log(today)
             play_counts = log.get("play_counts", {})
             
             selected = select_song_from_candidates(
-                candidates, play_counts, selection_mode=selection_mode
+                liked_today_candidates, play_counts, selection_mode=selection_mode
             )
             if selected:
                 count = play_counts.get(selected["track_id"], 0)
                 if verbose:
                     plays_str = f"({count} plays)" if count > 0 else "(not played today)"
                     print(f"    Selected: {selected['track_name']} — {selected['artist']} {plays_str}")
-                return selected, candidates
+                return selected, liked_today_candidates, listened_candidates
     
     # === Fallback cascade: Listening history ===
+    # Only use today's listening for the candidates we report
+    # (multi-day fallback is just for selection, not for email reporting)
     fallback_levels = [
-        ("today's listening", [today]),
-        ("last 2 days", [today, today - timedelta(days=1)]),
-        ("last 3 days", [today - timedelta(days=i) for i in range(3)]),
-        ("last week", [today - timedelta(days=i) for i in range(7)]),
+        ("today's listening", [today], True),  # True = include in listened_candidates
+        ("last 2 days", [today, today - timedelta(days=1)], False),
+        ("last 3 days", [today - timedelta(days=i) for i in range(3)], False),
+        ("last week", [today - timedelta(days=i) for i in range(7)], False),
     ]
     
-    for level_name, days in fallback_levels:
+    for level_name, days, include_in_report in fallback_levels:
         if verbose:
             print(f"\n  Trying {level_name}...")
         
@@ -1453,6 +1506,10 @@ def select_song_with_candidates(
         if verbose:
             print(f"    Found {len(candidates)} eligible candidates")
         
+        # Always collect today's listening candidates for reporting
+        if include_in_report:
+            listened_candidates = candidates.copy()
+        
         if candidates:
             selected = select_song_from_candidates(
                 candidates, play_counts, selection_mode=selection_mode
@@ -1461,7 +1518,7 @@ def select_song_with_candidates(
                 count = play_counts.get(selected["track_id"], 1)
                 if verbose:
                     print(f"    Selected: {selected['track_name']} — {selected['artist']} ({count} plays)")
-                return selected, candidates
+                return selected, liked_today_candidates, listened_candidates
     
     # === Final fallback: Random from Liked Songs ===
     if verbose:
@@ -1482,12 +1539,12 @@ def select_song_with_candidates(
         selected = random.choice(candidates)
         if verbose:
             print(f"    Selected: {selected['track_name']} — {selected['artist']}")
-        return selected, candidates
+        return selected, liked_today_candidates, listened_candidates
     
     if verbose:
         print(f"  ❌ No eligible songs found anywhere!")
     
-    return None, []
+    return None, liked_today_candidates, listened_candidates
 
 
 # =============================================================================
@@ -1611,7 +1668,8 @@ def finalize_day(
     
     # Track what we add and candidates considered
     songs_added: List[Dict[str, Any]] = []
-    all_candidates: List[Dict[str, Any]] = []
+    all_liked_candidates: List[Dict[str, Any]] = []
+    all_listened_candidates: List[Dict[str, Any]] = []
     extra_exclude_ids: set = set()
     
     if songs_needed <= 0:
@@ -1621,6 +1679,16 @@ def finalize_day(
             else:
                 print(f"\n✅ Playlist is {-songs_needed} song(s) ahead of schedule")
             print(f"No action needed.")
+        
+        # Even if no songs needed, still collect candidates for email reporting
+        # (shows what would have been selected if needed)
+        _, liked_candidates, listened_candidates = select_song_with_candidates(
+            sp, config, snapshot, 
+            verbose=False, 
+            extra_exclude_ids=extra_exclude_ids
+        )
+        all_liked_candidates = liked_candidates
+        all_listened_candidates = listened_candidates
     else:
         if verbose:
             print(f"\n🎵 Need to add {songs_needed} song(s)...")
@@ -1634,18 +1702,25 @@ def finalize_day(
             if songs_added and not dry_run:
                 snapshot = take_playlist_snapshot(sp, config)
             
-            selected, candidates = select_song_with_candidates(
+            selected, liked_candidates, listened_candidates = select_song_with_candidates(
                 sp, config, snapshot, 
                 verbose=verbose, 
                 extra_exclude_ids=extra_exclude_ids
             )
             
-            # Collect candidates (avoid duplicates)
-            existing_candidate_ids = {c["track_id"] for c in all_candidates}
-            for c in candidates:
-                if c["track_id"] not in existing_candidate_ids:
-                    all_candidates.append(c)
-                    existing_candidate_ids.add(c["track_id"])
+            # Collect liked candidates (avoid duplicates)
+            existing_liked_ids = {c["track_id"] for c in all_liked_candidates}
+            for c in liked_candidates:
+                if c["track_id"] not in existing_liked_ids:
+                    all_liked_candidates.append(c)
+                    existing_liked_ids.add(c["track_id"])
+            
+            # Collect listened candidates (avoid duplicates)
+            existing_listened_ids = {c["track_id"] for c in all_listened_candidates}
+            for c in listened_candidates:
+                if c["track_id"] not in existing_listened_ids:
+                    all_listened_candidates.append(c)
+                    existing_listened_ids.add(c["track_id"])
             
             if not selected:
                 print(f"\n⚠️ Could not find eligible song #{i + 1}. Stopping.", file=sys.stderr)
@@ -1733,7 +1808,8 @@ def finalize_day(
         recent_tracks=recent_tracks,
         dry_run=dry_run,
         profile_name=profile_name,
-        candidates=all_candidates,
+        liked_today_candidates=all_liked_candidates,
+        listened_candidates=all_listened_candidates,
         play_counts=play_counts,
         all_listened_songs=all_listened_songs,
     )
