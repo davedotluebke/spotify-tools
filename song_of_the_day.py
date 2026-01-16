@@ -413,8 +413,8 @@ def send_nightly_email(
                 count = play_counts.get(track["track_id"], 0)
                 lines.append(f"    • {track['track_name']} — {track['artist']} ({count})")
         
-        # Show listened candidates
-        lines.append(f"\n  🎧 Listened today ({len(listened_candidates)}):")
+        # Show listened candidates (songs listened but not liked today)
+        lines.append(f"\n  🎧 Other listened today ({len(listened_candidates)}):")
         if listened_candidates:
             # Sort by play count descending
             sorted_listened = sorted(listened_candidates, 
@@ -517,9 +517,9 @@ def send_nightly_email(
             html_lines.append("<span style='color:#999;'>(none)</span>")
         html_lines.append("</td>")
         
-        # Right column: Listened today
+        # Right column: Other listened today (songs listened but not liked today)
         html_lines.append("<td style='padding: 8px; width: 50%;'>")
-        html_lines.append(f"<strong>🎧 Listened today ({len(listened_candidates)})</strong><br>")
+        html_lines.append(f"<strong>🎧 Other listened today ({len(listened_candidates)})</strong><br>")
         if listened_candidates:
             sorted_listened = sorted(listened_candidates, 
                                      key=lambda x: play_counts.get(x["track_id"], 0), reverse=True)
