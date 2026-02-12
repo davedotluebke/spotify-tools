@@ -50,6 +50,8 @@ import time
 import pytz
 import requests
 
+from spotipy.oauth2 import SpotifyOauthError
+
 from spotify_auth import (
     get_spotify_client, 
     get_state_dir, 
@@ -61,7 +63,8 @@ from spotify_auth import (
 
 def retry_on_timeout(func, retries: int = 3, delay: float = 2.0):
     """
-    Retry a function on transient network errors (timeouts, connection errors).
+    Retry a function on transient network errors (timeouts, connection errors,
+    Spotify OAuth 503/unavailable during token refresh).
     
     Returns the function result, or raises the last exception if all retries fail.
     """
@@ -71,7 +74,8 @@ def retry_on_timeout(func, retries: int = 3, delay: float = 2.0):
             return func()
         except (requests.exceptions.Timeout, 
                 requests.exceptions.ConnectionError,
-                requests.exceptions.ReadTimeout) as e:
+                requests.exceptions.ReadTimeout,
+                SpotifyOauthError) as e:
             last_exception = e
             if attempt < retries - 1:
                 time.sleep(delay * (attempt + 1))  # Exponential backoff
