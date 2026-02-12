@@ -50,6 +50,7 @@ import time
 import pytz
 import requests
 
+from spotipy.exceptions import SpotifyException
 from spotipy.oauth2 import SpotifyOauthError
 
 from spotify_auth import (
@@ -61,10 +62,33 @@ from spotify_auth import (
 )
 
 
+def _is_transient(exc: Exception) -> bool:
+    """Check if an exception looks transient (worth retrying)."""
+    if isinstance(exc, (requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.ReadTimeout,
+                        SpotifyOauthError)):
+        return True
+    # SpotifyException with 5xx or 429 status
+    if isinstance(exc, SpotifyException) and exc.http_status in (429, 500, 502, 503, 504):
+        return True
+    return False
+
+
+# Exception types caught for retry / graceful handling in cron modes
+TRANSIENT_ERRORS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ReadTimeout,
+    SpotifyOauthError,
+    SpotifyException,
+)
+
+
 def retry_on_timeout(func, retries: int = 3, delay: float = 2.0):
     """
     Retry a function on transient network errors (timeouts, connection errors,
-    Spotify OAuth 503/unavailable during token refresh).
+    Spotify OAuth 503/unavailable during token refresh, server 5xx).
     
     Returns the function result, or raises the last exception if all retries fail.
     """
@@ -72,10 +96,9 @@ def retry_on_timeout(func, retries: int = 3, delay: float = 2.0):
     for attempt in range(retries):
         try:
             return func()
-        except (requests.exceptions.Timeout, 
-                requests.exceptions.ConnectionError,
-                requests.exceptions.ReadTimeout,
-                SpotifyOauthError) as e:
+        except TRANSIENT_ERRORS as e:
+            if not _is_transient(e):
+                raise  # Non-transient SpotifyException (e.g. 404), don't retry
             last_exception = e
             if attempt < retries - 1:
                 time.sleep(delay * (attempt + 1))  # Exponential backoff
@@ -2172,7 +2195,16 @@ Examples:
     
     # Execute mode
     if args.poll:
-        poll_listening_history(sp, config, verbose=verbose)
+        try:
+            poll_listening_history(sp, config, verbose=verbose)
+        except TRANSIENT_ERRORS as e:
+            if _is_transient(e):
+                # Transient error after retries exhausted — exit cleanly.
+                # Next cron invocation (in ~60s) will try again; no error email.
+                print(f"⚠ Transient error during poll, will retry next cycle: {e}",
+                      file=sys.stderr)
+                return 0
+            raise
         return 0
     
     elif args.status:
