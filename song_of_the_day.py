@@ -957,7 +957,7 @@ def find_playlist_by_name(sp, name: str) -> Optional[Dict[str, Any]]:
     name_lower = name.lower().strip()
     candidate = None
     
-    results = sp.current_user_playlists(limit=50)
+    results = retry_on_timeout(lambda: sp.current_user_playlists(limit=50))
     while results:
         for pl in results.get("items", []):
             pl_name = pl.get("name", "").lower().strip()
@@ -967,7 +967,7 @@ def find_playlist_by_name(sp, name: str) -> Optional[Dict[str, Any]]:
                 candidate = pl  # Partial match fallback
         
         if results.get("next"):
-            results = sp.next(results)
+            results = retry_on_timeout(lambda: sp.next(results))
         else:
             break
     
@@ -996,13 +996,13 @@ def get_playlist_id(sp, config: Dict[str, Any], create_if_missing: bool = True) 
     # Create playlist if it doesn't exist
     if not playlist and create_if_missing:
         print(f"📝 Playlist '{playlist_name}' not found, creating it...")
-        user_id = sp.current_user()["id"]
-        new_playlist = sp.user_playlist_create(
+        user_id = retry_on_timeout(lambda: sp.current_user())["id"]
+        new_playlist = retry_on_timeout(lambda: sp.user_playlist_create(
             user_id,
             playlist_name,
             public=False,
             description="Daily song picks - auto-managed by song_of_the_day.py"
-        )
+        ))
         playlist = new_playlist
         print(f"✅ Created playlist: {playlist_name}")
     
@@ -1025,12 +1025,12 @@ def fetch_playlist_tracks(sp, playlist_id: str) -> List[Dict[str, Any]]:
     tracks = []
     position = 0
     
-    results = sp.playlist_items(
+    results = retry_on_timeout(lambda: sp.playlist_items(
         playlist_id,
         additional_types=("track",),
         fields="items(added_at,track(id,name,artists(name),duration_ms,type)),next",
         limit=100,
-    )
+    ))
     
     while results:
         for item in results.get("items", []):
@@ -1050,7 +1050,7 @@ def fetch_playlist_tracks(sp, playlist_id: str) -> List[Dict[str, Any]]:
             position += 1
         
         if results.get("next"):
-            results = sp.next(results)
+            results = retry_on_timeout(lambda: sp.next(results))
         else:
             break
     
@@ -1372,7 +1372,7 @@ def fetch_todays_liked_songs(
             break
         
         if results.get("next"):
-            results = sp.next(results)
+            results = retry_on_timeout(lambda: sp.next(results))
         else:
             break
     
@@ -1387,7 +1387,7 @@ def fetch_liked_songs_sample(sp, limit: int = 200) -> List[Dict[str, Any]]:
     Fetch a sample of the user's Liked Songs for fallback selection.
     """
     tracks = []
-    results = sp.current_user_saved_tracks(limit=50)
+    results = retry_on_timeout(lambda: sp.current_user_saved_tracks(limit=50))
     
     while results and len(tracks) < limit:
         for item in results.get("items", []):
@@ -1405,7 +1405,7 @@ def fetch_liked_songs_sample(sp, limit: int = 200) -> List[Dict[str, Any]]:
             })
         
         if results.get("next") and len(tracks) < limit:
-            results = sp.next(results)
+            results = retry_on_timeout(lambda: sp.next(results))
         else:
             break
     
@@ -1594,7 +1594,7 @@ def add_track_to_playlist(sp, playlist_id: str, track_id: str) -> bool:
     """
     try:
         track_uri = f"spotify:track:{track_id}"
-        sp.playlist_add_items(playlist_id, [track_uri])
+        retry_on_timeout(lambda: sp.playlist_add_items(playlist_id, [track_uri]))
         return True
     except Exception as e:
         print(f"  ❌ Failed to add track: {e}", file=sys.stderr)
