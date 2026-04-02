@@ -60,6 +60,7 @@ A daily script that ensures exactly one song is added to the "Dave Songs of the 
 | `--status` | Manual | Poll first, then show today's listening stats and playlist state |
 | `--status --no-poll` | Manual | Show cached stats without polling (faster, for debugging) |
 | `--dry-run` | Manual | Run finalize logic but don't actually add to playlist |
+| `--print-email` | Manual | With `--finalize` or `--dry-run`: print nightly report to stdout (independent of `email_enabled`) |
 | `--weekly-summary` | Weekly via cron | Generate and email summary of week's songs (user vs auto) |
 
 ### 2. Local State Files
@@ -371,6 +372,8 @@ spotify-tools/
 - [x] Add email notification on failure (auto-sends if email configured)
 - [x] Add weekly summary email of songs added (`--weekly-summary`)
 - [x] Track user vs auto-added songs in additions.json
+- [x] Nightly email: warn when a recent playlist slot violates `cooldown_entries` (manual duplicate within the window)
+- [x] `--print-email` for `--finalize` / `--dry-run` to print nightly report to stdout independently of SMTP
 
 ### Phase 6: Multi-User Support ✅
 - [x] Profile system (`--profile NAME`) for multiple configurations

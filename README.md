@@ -15,7 +15,9 @@ Maintains a "Song of the Day" playlist by adding one song per day based on your 
 - Multiple profiles for different playlists/users/rules
 - Auto-creates playlists if they don't exist
 - Tracks whether songs were user-added or auto-picked
-- Optional email notifications (failures + weekly summary)
+- Optional email notifications (failures + nightly report after finalize + weekly summary)
+- Nightly report warns if a manual add repeats a track inside the cooldown window
+- `--print-email` prints the nightly report to stdout without requiring SMTP (independent of sending)
 
 ### `liked_songs_by_country.py`
 
@@ -77,6 +79,7 @@ This opens a browser for Spotify login. After authenticating, your token is cach
 | `--status --no-poll` | Show cached stats without refreshing |
 | `--finalize` | Add a song if none added today (run nightly via cron) |
 | `--dry-run` | Test finalize without actually adding to playlist |
+| `--print-email` | With `--finalize` or `--dry-run`: print nightly report to stdout (separate from `email_enabled`) |
 | `--weekly-summary` | Generate/email summary of the week's songs |
 | `--profile NAME` | Use a specific profile (see Profiles section) |
 | `-q, --quiet` | Suppress non-essential output |
@@ -89,6 +92,10 @@ python song_of_the_day.py --status
 
 # See what would be auto-picked without adding it
 python song_of_the_day.py --dry-run
+
+# Print the nightly report to the terminal (still sends mail if email_enabled)
+python song_of_the_day.py --dry-run --print-email
+python song_of_the_day.py --finalize --print-email
 
 # Generate weekly summary (prints to console, emails if configured)
 python song_of_the_day.py --weekly-summary
@@ -322,10 +329,14 @@ When songs need to be added:
 
 ### Nightly Email
 
-After each finalize run, an email is sent (if configured) showing:
-- The song added (and whether it was auto-added or user-added)
-- The last 5 songs in the playlist with 🤖/👤 icons
-- Error details only if something went wrong
+After each `--finalize` or `--dry-run`, an email is sent when `email_enabled` is true and SMTP is configured. The message includes:
+
+- Subject line reflecting the latest addition (auto or user) or an error state
+- The last five playlist tracks with 🤖 (ever auto-added per log) vs 👤 icons
+- **Cooldown warning:** if any of those last five slots repeats a track still inside the configured `cooldown_entries` window (common when a song is added manually too soon), a plain-text and HTML note explains which track repeated and how many other songs separated the two copies
+- Candidates considered from listening data, other listened tracks, and error details when something went wrong
+
+Use **`--print-email`** with `--finalize` or `--dry-run` to print the same subject, plain text, and HTML to stdout. That works even when email is disabled, and does not replace sending: if `email_enabled` is true, both print and SMTP delivery run.
 
 ### Why Minute-by-Minute Polling?
 
