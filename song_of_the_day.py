@@ -90,6 +90,8 @@ def retry_on_timeout(func, retries: int = 3, delay: float = 2.0):
     Retry a function on transient network errors (timeouts, connection errors,
     Spotify OAuth 503/unavailable during token refresh, server 5xx).
     
+    Logs each retry attempt to retry-log.json for weekly summary reporting.
+    
     Returns the function result, or raises the last exception if all retries fail.
     """
     last_exception = None
@@ -100,6 +102,10 @@ def retry_on_timeout(func, retries: int = 3, delay: float = 2.0):
             if not _is_transient(e):
                 raise  # Non-transient SpotifyException (e.g. 404), don't retry
             last_exception = e
+            try:
+                record_retry(e, attempt, retries)
+            except Exception:
+                pass  # Don't let logging failure break retry logic
             if attempt < retries - 1:
                 time.sleep(delay * (attempt + 1))  # Exponential backoff
                 continue
@@ -332,6 +338,7 @@ def send_nightly_email(
     playlist_count_after: int,
     recent_tracks: List[Dict[str, Any]],
     dry_run: bool = False,
+    print_email: bool = False,
     error_message: Optional[str] = None,
     profile_name: Optional[str] = None,
     liked_today_candidates: Optional[List[Dict[str, Any]]] = None,
@@ -343,7 +350,8 @@ def send_nightly_email(
     Send a nightly summary email after finalize runs.
     
     Subject format: "SotD [<profile>]: Added <song> by <artist>"
-    Body shows last 5 songs with 🤖/👤 icons, candidates considered, and all listened songs.
+    Body shows last 5 songs with 🤖/👤 icons, cooldown warnings if a recent slot
+    repeats within the configured cooldown window, candidates considered, and all listened songs.
     
     Args:
         recent_tracks: Last N tracks from the playlist (most recent last)
@@ -353,6 +361,7 @@ def send_nightly_email(
         listened_candidates: Songs from listening history that were eligible candidates
         play_counts: Dict of track_id -> play count
         all_listened_songs: All songs listened to that day
+        print_email: If True, print subject + plain/HTML bodies to stdout (still sends if email_enabled)
     """
     playlist_name = config.get('playlist_name', 'Song of the Day')
     year_start = get_year_start_date(config)
@@ -420,6 +429,21 @@ def send_nightly_email(
             else:
                 icon = "👤"  # User-added
             lines.append(f"  {icon} {track['track_name']} — {track['artist']}")
+        
+        cooldown_n = config.get("cooldown_entries", 90)
+        cd_violations = find_cooldown_violations_in_tail(
+            recent_tracks, cooldown_n, tail=5
+        )
+        if cd_violations:
+            lines.append("")
+            for v in cd_violations:
+                between = v["entries_between"]
+                lines.append(
+                    f"⚠️ Cooldown ({cooldown_n} entries): “{v['track_name']}” by {v['artist']} "
+                    f"appears again with only {between} other song{'s' if between != 1 else ''} "
+                    f"between this copy and its previous playlist slot. "
+                    f"Auto-adds skip tracks that are still in the last {cooldown_n} entries."
+                )
         
         lines.append(f"{'─' * 50}")
     
@@ -521,6 +545,22 @@ def send_nightly_email(
             )
         
         html_lines.append("</table>")
+        cooldown_n = config.get("cooldown_entries", 90)
+        cd_violations = find_cooldown_violations_in_tail(
+            recent_tracks, cooldown_n, tail=5
+        )
+        if cd_violations:
+            for v in cd_violations:
+                between = v["entries_between"]
+                plural = "s" if between != 1 else ""
+                html_lines.append(
+                    f"<p style='color:#b45309; margin: 8px 0 0 0;'>"
+                    f"⚠️ <strong>Cooldown ({cooldown_n} entries):</strong> "
+                    f"“{v['track_name']}” by {v['artist']} appears again with only {between} "
+                    f"other song{plural} between this copy and its previous playlist slot. "
+                    f"Auto-adds skip tracks that are still in the last {cooldown_n} entries."
+                    f"</p>"
+                )
         html_lines.append("<hr>")
     
     # Show candidates in HTML - two-column table format
@@ -600,6 +640,17 @@ def send_nightly_email(
     html_lines.append("</body></html>")
     html_body = "\n".join(html_lines)
     
+    if print_email:
+        print("\n" + "=" * 60, file=sys.stdout)
+        print("NIGHTLY EMAIL (stdout; sending is separate — see email_enabled)", file=sys.stdout)
+        print(f"Subject: {subject}", file=sys.stdout)
+        print("=" * 60, file=sys.stdout)
+        print(body, file=sys.stdout)
+        print("-" * 60, file=sys.stdout)
+        print("HTML body:", file=sys.stdout)
+        print(html_body, file=sys.stdout)
+        print("=" * 60 + "\n", file=sys.stdout)
+    
     send_email(config, subject, body, html_body, from_name="Song of the Day")
 
 
@@ -626,6 +677,81 @@ def save_additions_log(log: List[Dict[str, Any]]) -> None:
     log_path = get_additions_log_path()
     with open(log_path, "w", encoding="utf-8") as f:
         json.dump(log, f, indent=2)
+
+
+def get_retry_log_path() -> Path:
+    """Return path to the retry log file."""
+    return get_state_dir() / "retry-log.json"
+
+
+def load_retry_log() -> List[Dict[str, Any]]:
+    """Load the retry log, or empty list if not exists."""
+    log_path = get_retry_log_path()
+    if log_path.exists():
+        with open(log_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def save_retry_log(log: List[Dict[str, Any]]) -> None:
+    """Save the retry log."""
+    log_path = get_retry_log_path()
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2)
+
+
+def record_retry(error: Exception, attempt: int, max_retries: int) -> None:
+    """Record a retry event to the log."""
+    log = load_retry_log()
+    log.append({
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "error_type": type(error).__name__,
+        "error_message": str(error)[:200],  # Truncate long messages
+        "attempt": attempt + 1,
+        "max_retries": max_retries,
+    })
+    # Keep only last 30 days of entries (cap at ~5000 entries)
+    if len(log) > 5000:
+        log = log[-5000:]
+    save_retry_log(log)
+
+
+def get_retry_stats_for_period(start_date: date, end_date: date) -> Dict[str, Any]:
+    """
+    Get retry statistics for a date range.
+    
+    Returns dict with: total_retries, days_with_retries, by_error_type, by_date
+    """
+    log = load_retry_log()
+    
+    start_str = start_date.isoformat()
+    end_str = end_date.isoformat()
+    
+    filtered = []
+    for entry in log:
+        ts = entry.get("timestamp", "")[:10]  # Extract YYYY-MM-DD
+        if start_str <= ts <= end_str:
+            filtered.append(entry)
+    
+    if not filtered:
+        return {"total_retries": 0}
+    
+    # Count by error type
+    by_type: Dict[str, int] = {}
+    by_date: Dict[str, int] = {}
+    for entry in filtered:
+        err_type = entry.get("error_type", "Unknown")
+        by_type[err_type] = by_type.get(err_type, 0) + 1
+        
+        day = entry.get("timestamp", "")[:10]
+        by_date[day] = by_date.get(day, 0) + 1
+    
+    return {
+        "total_retries": len(filtered),
+        "days_with_retries": len(by_date),
+        "by_error_type": by_type,
+        "by_date": by_date,
+    }
 
 
 def record_addition(
@@ -1185,6 +1311,47 @@ def get_cooldown_track_ids(snapshot: Dict[str, Any], cooldown: int) -> set:
     return {t["track_id"] for t in cooldown_tracks}
 
 
+def find_cooldown_violations_in_tail(
+    tracks: List[Dict[str, Any]],
+    cooldown: int,
+    tail: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Find tracks whose newest occurrence breaks the same rule as auto-selection:
+    the same track_id must not appear in the last `cooldown` entries before that slot.
+
+    tracks: oldest first, newest last (playlist snapshot order).
+    Only reports violations whose newer occurrence lies in the last `tail` positions
+    (the same region as the nightly email "Recent songs" list).
+    """
+    if cooldown <= 0 or len(tracks) < 2 or tail <= 0:
+        return []
+
+    first_new_index = max(0, len(tracks) - tail)
+    out: List[Dict[str, Any]] = []
+    for i in range(max(1, first_new_index), len(tracks)):
+        tid = tracks[i]["track_id"]
+        window_start = max(0, i - cooldown)
+        prev_j: Optional[int] = None
+        for j in range(i - 1, window_start - 1, -1):
+            if tracks[j]["track_id"] == tid:
+                prev_j = j
+                break
+        if prev_j is not None:
+            between = i - prev_j - 1
+            out.append(
+                {
+                    "track_name": tracks[i]["track_name"],
+                    "artist": tracks[i]["artist"],
+                    "track_id": tid,
+                    "prior_index": prev_j,
+                    "new_index": i,
+                    "entries_between": between,
+                }
+            )
+    return out
+
+
 def is_eligible(
     track: Dict[str, Any], 
     cooldown_ids: set, 
@@ -1605,7 +1772,8 @@ def finalize_day(
     sp,
     config: Dict[str, Any],
     dry_run: bool = False,
-    verbose: bool = True
+    verbose: bool = True,
+    print_email: bool = False,
 ) -> int:
     """
     Finalize the day: ensure playlist has correct number of songs for day of year.
@@ -1842,6 +2010,7 @@ def finalize_day(
         playlist_count_after=playlist_count_after,
         recent_tracks=recent_tracks,
         dry_run=dry_run,
+        print_email=print_email,
         profile_name=profile_name,
         liked_today_candidates=all_liked_candidates,
         listened_candidates=all_listened_candidates,
@@ -2016,6 +2185,16 @@ def generate_weekly_summary(
     lines.append(f"")
     lines.append(f"👤 = manually added, 🤖 = auto-picked")
     
+    # Add retry stats footnote if there were any retries this week
+    retry_stats = get_retry_stats_for_period(start_date, end_date)
+    if retry_stats["total_retries"] > 0:
+        total = retry_stats["total_retries"]
+        days = retry_stats["days_with_retries"]
+        by_type = retry_stats.get("by_error_type", {})
+        type_summary = ", ".join(f"{count} {etype}" for etype, count in sorted(by_type.items(), key=lambda x: -x[1]))
+        lines.append(f"")
+        lines.append(f"⚠ Spotify API retries this week: {total} across {days} day(s) ({type_summary})")
+    
     plain_text = "\n".join(lines)
     
     # Build HTML version
@@ -2054,8 +2233,19 @@ def generate_weekly_summary(
         "</table>",
         "<hr>",
         "<p><small>👤 = manually added, 🤖 = auto-picked</small></p>",
-        "</body></html>",
     ])
+    
+    if retry_stats["total_retries"] > 0:
+        total = retry_stats["total_retries"]
+        days = retry_stats["days_with_retries"]
+        by_type = retry_stats.get("by_error_type", {})
+        type_summary = ", ".join(f"{count} {etype}" for etype, count in sorted(by_type.items(), key=lambda x: -x[1]))
+        html_lines.append(
+            f"<p><small style='color: #996;'>⚠ Spotify API retries this week: "
+            f"{total} across {days} day(s) ({type_summary})</small></p>"
+        )
+    
+    html_lines.append("</body></html>")
     
     html_text = "\n".join(html_lines)
     
@@ -2122,6 +2312,7 @@ Examples:
   %(prog)s --status                     # Poll + show today's stats (always fresh)
   %(prog)s --finalize                   # Add song if none added today (run nightly)
   %(prog)s --dry-run                    # Test finalize without modifying playlist
+  %(prog)s --finalize --print-email     # Print nightly report to stdout (no SMTP required)
   %(prog)s --weekly-summary             # Email summary of this week's songs
   %(prog)s --profile dave-auto --poll   # Use a different profile
         """,
@@ -2170,8 +2361,15 @@ Examples:
         action="store_true",
         help="For --status: skip implicit poll, show cached data only",
     )
+    parser.add_argument(
+        "--print-email",
+        action="store_true",
+        help="With --finalize or --dry-run: print nightly report to stdout (independent of email_enabled / SMTP)",
+    )
     
     args = parser.parse_args()
+    if args.print_email and not (args.finalize or args.dry_run):
+        parser.error("--print-email only applies with --finalize or --dry-run")
     verbose = not args.quiet
     
     # Set profile before anything else
@@ -2217,7 +2415,13 @@ Examples:
         return 0
     
     elif args.finalize or args.dry_run:
-        return finalize_day(sp, config, dry_run=args.dry_run, verbose=verbose)
+        return finalize_day(
+            sp,
+            config,
+            dry_run=args.dry_run,
+            verbose=verbose,
+            print_email=args.print_email,
+        )
     
     elif args.weekly_summary:
         return send_weekly_summary(config, verbose=verbose)
