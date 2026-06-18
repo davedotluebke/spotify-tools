@@ -17,6 +17,13 @@ For headless servers (EC2):
 1. Run any script locally first to complete the OAuth browser flow
 2. Copy ~/.spotify-tools/.cache to the server
 3. The token will auto-refresh as long as .cache is writable
+
+Refresh token expiry (Spotify policy, effective 2026-07-20):
+Refresh tokens expire six months after issuance. When a refresh fails with
+invalid_grant, the stored token must be discarded and the user sent through the
+sign-in flow again. song_of_the_day.py detects this, discards the token, pauses
+cron modes, and (if configured) emails a re-auth request. Recover by running
+`song_of_the_day.py --reauth` locally and copying the fresh .cache to the server.
 """
 from __future__ import annotations
 

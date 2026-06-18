@@ -54,16 +54,40 @@ from spotipy.exceptions import SpotifyException
 from spotipy.oauth2 import SpotifyOauthError
 
 from spotify_auth import (
-    get_spotify_client, 
-    get_state_dir, 
+    get_spotify_client,
+    get_state_dir,
+    get_cache_path,
     get_current_user_display,
     set_profile,
     get_profile,
 )
 
 
+def _is_invalid_grant(exc: Exception) -> bool:
+    """
+    True if the exception is an expired or revoked Spotify refresh token.
+
+    As of 2026-07-20, Spotify refresh tokens expire after six months. When a
+    refresh token is expired or revoked, the token endpoint returns HTTP 400 with
+    {"error": "invalid_grant"}, which spotipy raises as a SpotifyOauthError with
+    .error == "invalid_grant".
+
+    This is NOT transient. Per Spotify's guidance, do not retry — the stored token
+    must be discarded and the user sent through the sign-in flow again.
+    """
+    if not isinstance(exc, SpotifyOauthError):
+        return False
+    if getattr(exc, "error", None) == "invalid_grant":
+        return True
+    # Fallback: older/other spotipy paths fold the code into the message string.
+    return "invalid_grant" in str(exc)
+
+
 def _is_transient(exc: Exception) -> bool:
     """Check if an exception looks transient (worth retrying)."""
+    # An expired/revoked refresh token is permanent until re-auth — never retry.
+    if _is_invalid_grant(exc):
+        return False
     if isinstance(exc, (requests.exceptions.Timeout,
                         requests.exceptions.ConnectionError,
                         requests.exceptions.ReadTimeout,
@@ -327,6 +351,137 @@ Please check the logs and fix the issue.
 """
     
     send_email(config, subject, body)
+
+
+# =============================================================================
+# Re-authorization (expired refresh token / invalid_grant)
+# =============================================================================
+
+def get_reauth_sentinel_path() -> Path:
+    """Return path to the sentinel marking an outstanding re-authorization."""
+    return get_state_dir() / "reauth-required.json"
+
+
+def clear_reauth_sentinel() -> None:
+    """Remove the re-auth sentinel, if present."""
+    sentinel = get_reauth_sentinel_path()
+    try:
+        if sentinel.exists():
+            sentinel.unlink()
+    except Exception:
+        pass
+
+
+def reauth_pending() -> bool:
+    """
+    True if a re-authorization is outstanding and not yet resolved.
+
+    The sentinel is written when a token refresh fails with invalid_grant. It is
+    cleared automatically once a fresh token cache (newer than the sentinel) is in
+    place — e.g. after running --reauth locally and copying .cache to the server.
+    """
+    sentinel = get_reauth_sentinel_path()
+    if not sentinel.exists():
+        return False
+    cache_path = get_cache_path()
+    try:
+        if cache_path.exists() and cache_path.stat().st_mtime > sentinel.stat().st_mtime:
+            # A newer token was supplied after the sentinel — re-auth resolved.
+            clear_reauth_sentinel()
+            return False
+    except OSError:
+        pass
+    return True
+
+
+def send_reauth_email(config: Dict[str, Any], message: str, context: str = "") -> None:
+    """Send an email asking the user to sign in to Spotify again."""
+    tz = pytz.timezone(config.get("timezone", "America/New_York"))
+    now = datetime.now(tz)
+
+    subject = f"🔑 Song of the Day — Spotify re-authorization required ({now.strftime('%Y-%m-%d')})"
+    body = f"""Spotify re-authorization is required as of {now.strftime('%Y-%m-%d %H:%M %Z')}
+
+Context: {context or 'Unknown'}
+
+{message}
+"""
+    send_email(config, subject, body, from_name="Song of the Day")
+
+
+def handle_invalid_grant(config: Dict[str, Any], context: str = "") -> None:
+    """
+    Handle an expired/revoked Spotify refresh token (invalid_grant).
+
+    Spotify refresh tokens expire after six months (effective 2026-07-20), so this
+    recurs roughly twice a year. Per Spotify's guidance we do NOT retry: the stored
+    token is discarded and the user must sign in again. Emails at most once per
+    outstanding re-auth (guarded by the sentinel) so the per-minute poll cron does
+    not spam notifications.
+    """
+    cache_path = get_cache_path()
+
+    # Discard the expired token so it is never reused or retried.
+    try:
+        if cache_path.exists():
+            cache_path.unlink()
+    except Exception:
+        pass
+
+    sentinel = get_reauth_sentinel_path()
+    already_notified = sentinel.exists()
+    try:
+        sentinel.write_text(
+            json.dumps({
+                "detected_at": datetime.utcnow().isoformat() + "Z",
+                "context": context,
+            }),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    message = (
+        "Spotify reports that the saved login has expired (invalid_grant).\n\n"
+        "As of 2026-07-20 Spotify refresh tokens expire after six months, so this "
+        "will recur roughly twice a year.\n\n"
+        "The expired token has been discarded. To restore service:\n"
+        "  1. On a machine with a browser, run:  song_of_the_day.py --reauth\n"
+        "  2. Copy the resulting .cache (e.g. ~/.spotify-tools/.cache, or the\n"
+        "     profile's directory) to the server.\n\n"
+        "Polling and nightly finalize are paused until a fresh token is in place."
+    )
+    print(f"\n⚠ Spotify re-authorization required.\n{message}", file=sys.stderr)
+
+    if not already_notified:
+        send_reauth_email(config, message, context=context)
+
+
+def do_reauth(config: Dict[str, Any], verbose: bool = True) -> int:
+    """
+    Discard the saved token and run the Spotify sign-in flow again.
+
+    Run this locally (it opens a browser). Afterwards, copy the refreshed .cache to
+    any headless server that shares this profile.
+    """
+    cache_path = get_cache_path()
+    try:
+        if cache_path.exists():
+            cache_path.unlink()
+            if verbose:
+                print(f"Discarded existing token: {cache_path}")
+    except Exception as e:
+        print(f"Could not remove {cache_path}: {e}", file=sys.stderr)
+
+    # Run the OAuth flow (opens a browser locally) and force a token fetch.
+    sp = get_spotify_client(open_browser=True)
+    user = get_current_user_display(sp)
+    clear_reauth_sentinel()
+
+    print(f"✓ Re-authorized as: {user}")
+    print(f"Token saved to: {cache_path}")
+    print("If this is for a headless server, copy that .cache file there now.")
+    return 0
 
 
 def send_nightly_email(
@@ -2344,7 +2499,13 @@ Examples:
         action="store_true",
         help="Generate and email a summary of this week's songs",
     )
-    
+    mode.add_argument(
+        "--reauth",
+        action="store_true",
+        help="Discard the saved token and run the Spotify sign-in flow again "
+             "(run locally, then copy .cache to any headless server)",
+    )
+
     parser.add_argument(
         "--profile", "-p",
         type=str,
@@ -2383,7 +2544,19 @@ Examples:
         print(f"Profile: {profile_name}")
         print(f"State directory: {get_state_dir()}")
         print(f"Config: {get_config_path()}")
-    
+
+    # Re-authorization entry point (run locally; opens a browser).
+    if args.reauth:
+        return do_reauth(config, verbose=verbose)
+
+    # If a prior run flagged an expired refresh token and it hasn't been replaced
+    # yet, skip quietly instead of failing every cron cycle until re-auth is done.
+    if reauth_pending():
+        print("⚠ Spotify re-authorization required; skipping run until a fresh "
+              "token is in place. Run --reauth locally, then copy .cache to the server.",
+              file=sys.stderr)
+        return 0
+
     # Authenticate
     sp = get_spotify_client()
     
@@ -2445,18 +2618,31 @@ if __name__ == "__main__":
         print("\nAborted by user.")
         sys.exit(130)
     except Exception as e:
+        context = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "unknown"
+
+        # Expired/revoked refresh token: discard it and ask the user to sign in
+        # again (do not retry, do not send the generic failure email).
+        if _is_invalid_grant(e):
+            print(f"\n⚠ Spotify refresh token expired (invalid_grant): {e}",
+                  file=sys.stderr)
+            try:
+                config = load_config()
+                handle_invalid_grant(config, context=f"Running: {context}")
+            except Exception:
+                pass  # Don't fail on failure to notify
+            sys.exit(1)
+
         # Send failure notification if possible
         error_msg = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
         print(f"\n❌ Unexpected error: {e}", file=sys.stderr)
         print(traceback.format_exc(), file=sys.stderr)
-        
+
         try:
             # Try to load config and send failure email
             config = load_config()
-            context = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "unknown"
             send_failure_email(config, error_msg, context=f"Running: {context}")
         except Exception:
             pass  # Don't fail on failure to send email
-        
+
         sys.exit(1)
 

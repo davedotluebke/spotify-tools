@@ -244,6 +244,30 @@ The first authentication requires a browser. To set up on a headless server:
 
 **For different Spotify accounts**, use incognito mode when authenticating to avoid picking up your own login cookies.
 
+#### Refresh tokens expire every 6 months
+
+As of **2026-07-20**, Spotify refresh tokens expire six months after they are
+issued. When that happens, the next token refresh fails with `invalid_grant` and
+the app must re-authenticate (this is a Spotify policy, not a bug). The scripts
+handle this automatically:
+
+- The expired token is **discarded** (not retried).
+- `--poll` / `--finalize` **pause** instead of erroring every cron cycle, and a
+  one-time **"Spotify re-authorization required"** email is sent (if email is
+  configured).
+
+To restore service:
+
+1. On a machine with a browser, run `song_of_the_day.py --reauth` (use
+   `--profile NAME` for non-default profiles). This discards the old token and
+   runs the sign-in flow again.
+2. Copy the refreshed `.cache` to the server (same as initial setup).
+
+Polling/finalize resume automatically once the fresh `.cache` is in place.
+
+> Tip: run `--reauth` ahead of time to confirm the flow works before the first
+> expiry on 2026-07-20.
+
 ---
 
 ## Email Setup (Optional)
@@ -376,6 +400,11 @@ The script requests these Spotify OAuth scopes:
 ### "Permissions missing" error
 - Delete `~/.spotify-tools/.cache` and re-authenticate
 - New scopes may have been added since your last login
+
+### `invalid_grant` / "re-authorization required" email
+- Your Spotify refresh token expired (they expire every 6 months as of
+  2026-07-20). Run `song_of_the_day.py --reauth` locally, then copy the new
+  `.cache` to the server. See [Headless Server Setup](#headless-server-ec2-setup).
 
 ### Songs not being captured
 - Ensure `--poll` is running every minute
