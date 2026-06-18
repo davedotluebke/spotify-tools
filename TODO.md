@@ -308,6 +308,31 @@ CRON_TZ=America/New_York
 
 ---
 
+## Infrastructure / Maintenance
+
+### Pending: Amazon Linux 2 → 2023 migration (do this soon)
+
+The production server (`ec2-user@3.212.138.180`, repo at `~/src/spotify-tools`)
+runs **Amazon Linux 2, which reaches end-of-life June 2026**. Plan to migrate the
+whole box to **Amazon Linux 2023**, and treat that as the moment to upgrade all
+runtime components together:
+
+- **Python 3.7.16 → current (3.11/3.12).** AL2's default `/usr/bin/python3` is 3.7
+  (EOL) and can't be replaced without risking OS tooling. AL2023 ships a modern
+  Python.
+- **spotipy 2.23.0 → 2.25.1+.** Blocked today: 2.24.0+ require Python ≥3.8, so
+  2.23.0 is the ceiling on 3.7. A newer Python unblocks this.
+- **Use a virtualenv** instead of the current global `~/.local` installs, and
+  refresh the other deps (`requirements.txt`: python-dotenv, pytz, openai,
+  requests; drop the `urllib3<2.0` pin once on Python ≥3.8).
+- **Re-point the 9 cron lines** (3 profiles × poll/finalize/weekly) at the venv
+  Python, and **copy each profile's `.cache`** to the new box (default,
+  dave-auto, edwin). See README "Headless Server (EC2) Setup".
+
+Verify all three profiles poll cleanly on the new box before decommissioning AL2.
+
+---
+
 ## Edge Cases to Handle
 
 | Scenario | Handling |
